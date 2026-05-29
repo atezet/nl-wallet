@@ -1,0 +1,651 @@
+use std::sync::Arc;
+
+use flutter_api_macros::flutter_api_error;
+use flutter_rust_bridge::DartFnFuture;
+use flutter_rust_bridge::frb;
+use itertools::Itertools;
+use tokio::sync::OnceCell;
+use tokio::sync::RwLock;
+use url::Url;
+use wallet::DisclosureUriSource;
+use wallet::PidIssuancePurpose;
+use wallet::UnlockMethod;
+use wallet::Wallet;
+use wallet::errors::WalletInitError;
+use wallet::utils::version_string;
+
+use crate::frb_generated::StreamSink;
+use crate::logging::init_logging;
+use crate::models::attestation::AttestationPresentation;
+use crate::models::config::FlutterConfiguration;
+use crate::models::disclosure::AcceptDisclosureResult;
+use crate::models::disclosure::CloseProximityDisclosureFlutterUpdate;
+use crate::models::disclosure::StartDisclosureResult;
+use crate::models::instruction::DisclosureBasedIssuanceResult;
+use crate::models::instruction::PidIssuanceResult;
+use crate::models::instruction::RevocationCodeResult;
+use crate::models::instruction::WalletInstructionResult;
+use crate::models::notification::AppNotification;
+use crate::models::notification::NotificationType;
+use crate::models::pin::PinValidationResult;
+use crate::models::transfer::TransferSessionState;
+use crate::models::uri::IdentifyUriResult;
+use crate::models::version_state::FlutterVersionState;
+use crate::models::wallet_event::WalletEvent;
+use crate::models::wallet_state::WalletState;
+use crate::sentry::init_sentry;
+
+static WALLET: OnceCell<RwLock<Wallet>> = OnceCell::const_new();
+
+fn wallet() -> &'static RwLock<Wallet> {
+    WALLET
+        .get()
+        .expect("Wallet must be initialized. Please execute `init()` first.")
+}
+
+fn set_env_if_unset(name: &str, value: &str) {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => unsafe { std::env::set_var(name, value) },
+        Ok(value) => tracing::info!("Skip setting env var `{name}` because it is already set to: {value}"),
+        Err(std::env::VarError::NotUnicode(value)) => tracing::info!(
+            "Skip setting env var `{name}` because it is already set to: {}",
+            value.to_string_lossy()
+        ),
+    }
+}
+
+#[frb(init)]
+#[flutter_api_error]
+pub async fn init() -> anyhow::Result<()> {
+    if !is_initialized() {
+        // Initialize platform specific logging and set the log level.
+        // As creating the wallet below could fail and init() could be called again,
+        // init_logging() should not fail when being called more than once.
+        init_logging();
+
+        // Setup logging to console and enable RUST_BACKTRACE to be caught on panics (but not errors) for Sentry.
+        set_env_if_unset("RUST_BACKTRACE", "1");
+        set_env_if_unset("RUST_LIB_BACKTRACE", "0");
+
+        // Initialize Sentry for Rust panics.
+        init_sentry();
+
+        create_wallet().await?;
+    }
+
+    Ok(())
+}
+
+pub fn is_initialized() -> bool {
+    WALLET.initialized()
+}
+
+/// This is called by the public [`init()`] function above.
+/// The returned `Result<bool>` is `true` if the wallet was successfully initialized,
+/// otherwise it indicates that the wallet was already created.
+async fn create_wallet() -> Result<(), WalletInitError> {
+    _ = WALLET
+        .get_or_try_init(|| async {
+            // This closure will only be called if WALLET_API_ENVIRONMENT is currently empty.
+            let wallet = Wallet::init_all().await?;
+            Ok::<_, WalletInitError>(RwLock::new(wallet))
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub fn is_valid_pin(pin: String) -> anyhow::Result<PinValidationResult> {
+    let result = wallet::validate_pin(&pin).into();
+
+    Ok(result)
+}
+
+pub async fn set_lock_stream(sink: StreamSink<bool>) {
+    wallet().write().await.set_lock_callback(Box::new(move |locked| {
+        let _ = sink.add(locked);
+    }));
+}
+
+pub async fn clear_lock_stream() {
+    wallet().write().await.clear_lock_callback();
+}
+
+pub async fn set_configuration_stream(sink: StreamSink<FlutterConfiguration>) {
+    wallet().read().await.set_config_callback(Box::new(move |config| {
+        let _ = sink.add(config.as_ref().into());
+    }));
+}
+
+pub async fn clear_configuration_stream() {
+    wallet().read().await.clear_config_callback();
+}
+
+pub async fn set_version_state_stream(sink: StreamSink<FlutterVersionState>) {
+    wallet().read().await.set_version_state_callback(Box::new(move |state| {
+        let _ = sink.add(state.into());
+    }));
+}
+
+pub async fn clear_version_state_stream() {
+    wallet().read().await.clear_version_state_callback();
+}
+
+pub async fn set_attestations_stream(sink: StreamSink<Vec<AttestationPresentation>>) -> anyhow::Result<()> {
+    wallet()
+        .write()
+        .await
+        .set_attestations_callback(Box::new(move |attestations| {
+            let _ = sink.add(attestations.into_iter().map(AttestationPresentation::from).collect());
+        }))
+        .await?;
+
+    Ok(())
+}
+
+pub async fn clear_attestations_stream() {
+    wallet().write().await.clear_attestations_callback();
+}
+
+pub async fn set_scheduled_notifications_stream(sink: StreamSink<Vec<AppNotification>>) -> anyhow::Result<()> {
+    wallet()
+        .write()
+        .await
+        .set_scheduled_notifications_callback(Box::new(move |notifications| {
+            let _ = sink.add(notifications.into_iter().map(AppNotification::from).collect());
+        }))
+        .await?;
+
+    Ok(())
+}
+
+pub async fn clear_scheduled_notifications_stream() {
+    wallet().write().await.clear_scheduled_notifications_callback();
+}
+
+pub async fn clear_direct_notifications_callback() {
+    wallet().write().await.clear_direct_notifications_callback();
+}
+
+pub async fn set_direct_notifications_callback(
+    callback: impl Fn(Vec<(i32, NotificationType)>) -> DartFnFuture<()> + Send + Sync + 'static,
+) -> anyhow::Result<()> {
+    let callback = Arc::new(callback);
+    let _ = wallet()
+        .write()
+        .await
+        .set_direct_notifications_callback(Arc::new(move |notifications| {
+            let callback = Arc::clone(&callback);
+            let notifications = notifications
+                .into_iter()
+                .map(|(id, notification_type)| (id, notification_type.into()))
+                .collect();
+            Box::pin(async move { callback(notifications).await })
+        }))?;
+
+    Ok(())
+}
+
+pub async fn perform_background_sync() -> anyhow::Result<()> {
+    wallet().write().await.perform_revocation_checks().await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn set_recent_history_stream(sink: StreamSink<Vec<WalletEvent>>) -> anyhow::Result<()> {
+    wallet()
+        .write()
+        .await
+        .set_recent_history_callback(Box::new(move |events| {
+            let recent_history = events.into_iter().map(WalletEvent::from).collect();
+
+            let _ = sink.add(recent_history);
+        }))
+        .await?;
+
+    Ok(())
+}
+
+pub async fn clear_recent_history_stream() {
+    wallet().write().await.clear_recent_history_callback();
+}
+
+#[flutter_api_error]
+pub async fn unlock_wallet(pin: String) -> anyhow::Result<WalletInstructionResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.unlock(pin).await.try_into()?;
+
+    Ok(result)
+}
+
+pub async fn lock_wallet() {
+    let mut wallet = wallet().write().await;
+
+    wallet.lock();
+}
+
+#[flutter_api_error]
+pub async fn check_pin(pin: String) -> anyhow::Result<WalletInstructionResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.check_pin(pin).await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn change_pin(old_pin: String, new_pin: String) -> anyhow::Result<WalletInstructionResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.begin_change_pin(old_pin, new_pin).await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn continue_change_pin(pin: &str) -> anyhow::Result<WalletInstructionResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.continue_change_pin(pin).await.try_into()?;
+
+    Ok(result)
+}
+
+pub async fn has_registration() -> bool {
+    wallet().read().await.has_registration()
+}
+
+#[flutter_api_error]
+pub async fn register(pin: &str) -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.register(pin).await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn identify_uri(uri: String) -> anyhow::Result<IdentifyUriResult> {
+    let wallet = wallet().read().await;
+
+    let identify_uri_result = wallet.identify_uri(&uri).try_into()?;
+
+    Ok(identify_uri_result)
+}
+
+#[flutter_api_error]
+pub async fn create_pid_issuance_redirect_uri() -> anyhow::Result<String> {
+    let mut wallet = wallet().write().await;
+
+    let auth_url = wallet
+        .create_pid_issuance_auth_url(PidIssuancePurpose::Enrollment)
+        .await?;
+
+    Ok(auth_url.into())
+}
+
+#[flutter_api_error]
+pub async fn create_pid_renewal_redirect_uri() -> anyhow::Result<String> {
+    let mut wallet = wallet().write().await;
+
+    let auth_url = wallet.create_pid_issuance_auth_url(PidIssuancePurpose::Renewal).await?;
+
+    Ok(auth_url.into())
+}
+
+#[flutter_api_error]
+pub async fn create_pin_recovery_redirect_uri() -> anyhow::Result<String> {
+    let mut wallet = wallet().write().await;
+
+    let auth_url = wallet.create_pin_recovery_redirect_uri().await?;
+
+    Ok(auth_url.into())
+}
+
+#[flutter_api_error]
+pub async fn continue_pin_recovery(uri: String) -> anyhow::Result<()> {
+    let url = Url::parse(&uri)?;
+
+    let mut wallet = wallet().write().await;
+
+    wallet.continue_pin_recovery(url).await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn complete_pin_recovery(pin: String) -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.complete_pin_recovery(pin).await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn cancel_pin_recovery() -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.cancel_pin_recovery().await?;
+
+    Ok(())
+}
+
+// TODO remove this function (PVW-5927)
+#[flutter_api_error]
+pub async fn cancel_issuance() -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.cancel_session().await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn continue_pid_issuance(uri: String) -> anyhow::Result<Vec<AttestationPresentation>> {
+    let url = Url::parse(&uri)?;
+
+    let mut wallet = wallet().write().await;
+
+    let wallet_attestations = wallet.continue_pid_issuance(url).await?;
+    let attestations = wallet_attestations
+        .into_iter()
+        .map(AttestationPresentation::from)
+        .collect();
+
+    Ok(attestations)
+}
+
+#[flutter_api_error]
+pub async fn accept_issuance(pin: String) -> anyhow::Result<WalletInstructionResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.accept_issuance(pin).await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn accept_pid_issuance(pin: String) -> anyhow::Result<PidIssuanceResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.accept_issuance(pin).await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn start_disclosure(uri: String, is_qr_code: bool) -> anyhow::Result<StartDisclosureResult> {
+    let url = Url::parse(&uri)?;
+
+    let mut wallet = wallet().write().await;
+
+    let result = wallet
+        .start_disclosure(&url, DisclosureUriSource::new(is_qr_code))
+        .await
+        .try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn start_close_proximity_disclosure(
+    callback: impl Fn(CloseProximityDisclosureFlutterUpdate) -> DartFnFuture<()> + Send + Sync + 'static,
+) -> anyhow::Result<String> {
+    let mut wallet = wallet().write().await;
+    let result = wallet
+        .start_close_proximity_disclosure(Box::new(move |update| callback(update.into())))
+        .await?;
+
+    Ok(result.into())
+}
+
+#[flutter_api_error]
+pub async fn continue_close_proximity_disclosure() -> anyhow::Result<StartDisclosureResult> {
+    let mut wallet = wallet().write().await;
+
+    let result: StartDisclosureResult = wallet.continue_close_proximity_disclosure().await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn cancel_session() -> anyhow::Result<Option<String>> {
+    let mut wallet = wallet().write().await;
+
+    let return_url = wallet.cancel_session().await?.map(String::from);
+
+    Ok(return_url)
+}
+
+// TODO remove this function (PVW-5927)
+#[flutter_api_error]
+pub async fn cancel_disclosure() -> anyhow::Result<Option<String>> {
+    let mut wallet = wallet().write().await;
+
+    let return_url = wallet.cancel_session().await?.map(String::from);
+
+    Ok(return_url)
+}
+
+#[flutter_api_error]
+pub async fn accept_disclosure(selected_indices: Vec<u16>, pin: String) -> anyhow::Result<AcceptDisclosureResult> {
+    let selected_indices = selected_indices.into_iter().map(usize::from).collect_vec();
+
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.accept_disclosure(&selected_indices, pin).await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn continue_disclosure_based_issuance(
+    selected_indices: Vec<u16>,
+    pin: String,
+) -> anyhow::Result<DisclosureBasedIssuanceResult> {
+    let selected_indices = selected_indices.into_iter().map(usize::from).collect_vec();
+
+    let mut wallet = wallet().write().await;
+
+    let result = wallet
+        .continue_disclosure_based_issuance(&selected_indices, pin)
+        .await
+        .try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn is_biometric_unlock_enabled() -> anyhow::Result<bool> {
+    let wallet = wallet().read().await;
+
+    let is_biometrics_enabled = wallet.unlock_method().await?.has_biometrics();
+
+    Ok(is_biometrics_enabled)
+}
+
+#[flutter_api_error]
+pub async fn set_biometric_unlock(enable: bool) -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    let unlock_method = if enable {
+        UnlockMethod::PinCodeAndBiometrics
+    } else {
+        UnlockMethod::PinCode
+    };
+    wallet.set_unlock_method(unlock_method).await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn unlock_wallet_with_biometrics() -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.unlock_without_pin().await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn init_wallet_transfer() -> anyhow::Result<String> {
+    let mut wallet = wallet().write().await;
+
+    let transfer_uri = wallet.init_transfer().await?;
+
+    Ok(transfer_uri.to_string())
+}
+
+#[flutter_api_error]
+pub async fn pair_wallet_transfer(uri: String) -> anyhow::Result<()> {
+    let url = Url::parse(&uri)?;
+
+    let mut wallet = wallet().write().await;
+
+    wallet.pair_transfer(url).await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn confirm_wallet_transfer(pin: String) -> anyhow::Result<WalletInstructionResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.confirm_transfer(pin).await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn transfer_wallet() -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.send_wallet_payload().await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn receive_wallet_transfer() -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.receive_wallet_payload().await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn cancel_wallet_transfer() -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.cancel_transfer(false).await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn skip_wallet_transfer() -> anyhow::Result<()> {
+    let mut wallet = wallet().write().await;
+
+    wallet.clear_transfer().await?;
+
+    Ok(())
+}
+
+#[flutter_api_error]
+pub async fn get_wallet_transfer_state() -> anyhow::Result<TransferSessionState> {
+    let mut wallet = wallet().write().await;
+
+    let state = wallet.get_transfer_status().await?;
+
+    Ok(state.into())
+}
+
+#[flutter_api_error]
+pub async fn get_wallet_state() -> anyhow::Result<WalletState> {
+    let wallet = wallet().read().await;
+
+    let state = wallet.get_state().await?;
+
+    Ok(state.into())
+}
+
+#[flutter_api_error]
+pub async fn get_history() -> anyhow::Result<Vec<WalletEvent>> {
+    let wallet = wallet().read().await;
+    let history = wallet.get_history().await?;
+    let history = history.into_iter().map(WalletEvent::from).collect();
+    Ok(history)
+}
+
+#[flutter_api_error]
+pub async fn get_history_for_card(attestation_id: String) -> anyhow::Result<Vec<WalletEvent>> {
+    let wallet = wallet().read().await;
+    let history = wallet.get_history_for_card(&attestation_id).await?;
+    let history = history.into_iter().map(WalletEvent::from).collect();
+    Ok(history)
+}
+
+#[flutter_api_error]
+pub async fn get_registration_revocation_code() -> anyhow::Result<String> {
+    let wallet = wallet().read().await;
+
+    let revocation_code = wallet.get_revocation_code_before_pid().await?;
+
+    Ok(revocation_code.clone().into())
+}
+
+#[flutter_api_error]
+pub async fn get_revocation_code(pin: String) -> anyhow::Result<RevocationCodeResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.get_revocation_code_with_pin(pin).await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn delete_attestation(pin: String, attestation_id: String) -> anyhow::Result<WalletInstructionResult> {
+    let mut wallet = wallet().write().await;
+
+    let result = wallet.delete_attestation(pin, attestation_id).await.try_into()?;
+
+    Ok(result)
+}
+
+#[flutter_api_error]
+pub async fn reset_wallet() -> anyhow::Result<()> {
+    wallet().write().await.reset().await?;
+
+    Ok(())
+}
+
+pub fn get_version_string() -> String {
+    version_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_is_valid_pin(pin: &str) -> bool {
+        matches!(
+            is_valid_pin(pin.to_string()).expect("Could not validate PIN"),
+            PinValidationResult::Ok
+        )
+    }
+
+    #[test]
+    fn check_valid_pin() {
+        assert!(test_is_valid_pin("142032"));
+    }
+
+    #[test]
+    fn check_invalid_pin() {
+        assert!(!test_is_valid_pin("sdfioj"));
+    }
+}

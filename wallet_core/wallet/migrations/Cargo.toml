@@ -1,0 +1,34 @@
+[package]
+name = "wallet_migrations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wallet_migrations"
+doctest = false
+required-features = ["cli"]
+
+[lib]
+doctest = false
+
+[features]
+cli = [
+    "sea-orm-migration/cli",
+    "sea-orm-migration/runtime-tokio",
+    "sea-orm-migration/sqlx-sqlite",
+    "tokio/rt",
+    "tokio/rt-multi-thread",
+    "tokio/macros",
+]
+
+[dependencies]
+async-trait.workspace = true
+sea-orm-migration.workspace = true
+
+tokio = { workspace = true, optional = true }
+
+entity.path = "../entity"

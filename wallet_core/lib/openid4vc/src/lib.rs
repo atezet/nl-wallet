@@ -1,0 +1,85 @@
+use serde_with::DeserializeFromStr;
+use serde_with::SerializeDisplay;
+
+// Data structures implemening OAuth/OpenID(4VCI) protocol messages.
+pub mod authorization;
+pub mod credential;
+pub mod credential_offer;
+pub mod issuer_identifier;
+pub mod metadata;
+pub mod par;
+pub mod token;
+
+// Cryptographic tools.
+pub mod dpop;
+pub mod jwe;
+pub mod pkce;
+
+// Issuance code for the server and client.
+pub mod credential_configurations;
+pub mod issuable_document;
+pub mod issuer;
+pub mod preview;
+pub mod wallet_issuance;
+
+// Verification code for the server and client.
+pub mod disclosure_session;
+pub mod openid4vp;
+pub mod return_url;
+pub mod verifier;
+
+// Errors used throughout the crate.
+pub mod errors;
+pub use errors::*;
+
+pub mod cose;
+pub mod jose;
+pub mod nonce;
+mod recurring_task;
+pub mod server_state;
+pub mod store;
+
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
+
+#[cfg(any(test, feature = "mock"))]
+pub mod test;
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    SerializeDisplay,
+    DeserializeFromStr,
+    strum::EnumString,
+    strum::Display,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum Format {
+    MsoMdoc,
+    #[default]
+    #[strum(serialize = "dc+sd-jwt")]
+    SdJwt,
+
+    // Other formats we don't currently support; we include them here so we can give the appropriate error message
+    // when they might be requested by the wallet (as opposed to a deserialization error).
+    // The OpenID4VCI and OpenID4VP specs aim to be general and do not provide an exhaustive list; the formats below
+    // are found as examples in the specs.
+    LdpVc,
+    JwtVc,
+    JwtVcJson,
+    AcVc, // Anonymous Credentials i.e. Idemix
+}
+
+impl Format {
+    pub fn is_supported(&self) -> bool {
+        match self {
+            Self::MsoMdoc | Self::SdJwt => true,
+            Self::LdpVc | Self::JwtVc | Self::JwtVcJson | Self::AcVc => false,
+        }
+    }
+}

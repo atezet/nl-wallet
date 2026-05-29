@@ -1,0 +1,9 @@
+{% let username = attributes | attribute("urn:eudi:pid:nl:1.given_name") %}
+{% call header::header(base.trans.marketplace_title, web_utils::OPTION_STR_NONE, Some(username)) %}
+
+<main>
+    {% let welcome = base.trans.welcome %}
+    {% call notification::notification("{} {}" | format(welcome, username), "", "") %}
+    {% call search::search(base.trans.search_by_topic) %}
+    {% call products::products(6) %}
+</main>

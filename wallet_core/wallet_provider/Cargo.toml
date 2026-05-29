@@ -1,0 +1,97 @@
+[package]
+name = "wallet_provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wallet_provider"
+
+[lib]
+doctest = false
+
+[[test]]
+name = "settings"
+path = "tests/settings.rs"
+required-features = ["hsm_test"]
+
+[features]
+default = []
+# Enable test API endpoints and Swagger UI for the management API. This should not be used in production.
+test_internal_ui = ["token_status_list/axum", "utoipa-swagger-ui/axum"]
+# Allow software key attestation_datas coming from the android emulator.
+# This is DANGEROUS and should not be used in any production environment.
+allow_android_emulator_keys = ["android_attest/allow_emulator_keys"]
+# Mocks responses from the Google Integrity Verdict API and spoofs the request hash in these responses.
+# This is DANGEROUS and should not be used in any production environment.
+mock_android_integrity_verdict = [
+    "wallet_provider_service/spoof_integrity_verdict_hash",
+    "wallet_provider_service/mock_play_integrity",
+]
+# Skip checking if root key is in allowed root keys
+# This is DANGEROUS and should not be used in any production environment.
+skip_android_root_key_check = ["android_attest/skip_root_key_check"]
+# Convenience feature to make the Wallet Provider work with the Android emulator during local development.
+# This is DANGEROUS and should not be used in any production environment.
+android_emulator = ["allow_android_emulator_keys", "mock_android_integrity_verdict", "skip_android_root_key_check"]
+# Include and run test that depend on a configured HSM
+hsm_test = ["dep:rand_core", "dep:serial_test", "hsm/test"]
+
+[dependencies]
+axum.workspace = true
+axum-server.workspace = true
+chrono = { workspace = true, features = ["now"] }
+config = { workspace = true, features = ["toml"] }
+derive_more = { workspace = true, features = ["as_ref", "display", "from", "into", "from_str"] }
+futures = { workspace = true, features = ["async-await"] }
+http.workspace = true
+log.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+p256 = { workspace = true, features = ["pem"] }
+regex.workspace = true
+rustix = { workspace = true, features = ["pipe", "stdio"] }
+rustls.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_with = { workspace = true, features = ["base64", "hex", "chrono"] }
+spki.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+tower-http = { workspace = true, features = ["trace", "decompression-zstd"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "json"] }
+url.workspace = true
+uuid = { workspace = true, features = ["serde", "v4", "v7"] }
+utoipa = { workspace = true, features = ["chrono"] }
+utoipa-axum.workspace = true
+
+rand_core = { workspace = true, optional = true }
+serial_test = { workspace = true, optional = true }
+utoipa-swagger-ui = { workspace = true, optional = true }
+
+android_attest.path = "../lib/android_attest"
+apple_app_attest.path = "../lib/apple_app_attest"
+audit_log.path = "audit_log"
+crypto.path = "../lib/crypto"
+health_checkers.path = "../lib/health_checkers"
+hsm.path = "../lib/hsm"
+http_utils = { path = "../lib/http_utils", features = ["server", "client"] }
+jwt.path = "../lib/jwt"
+readable_identifier.path = "readable_identifier"
+status_lists = { path = "../lib/status_lists", features = ["axum"] }
+utils.path = "../lib/utils"
+wallet_account = { path = "wallet_account", features = ["server"] }
+wallet_provider_domain = { path = "domain", features = ["utoipa"] }
+wallet_provider_persistence.path = "persistence"
+wallet_provider_service.path = "service"
+
+token_status_list = { path = "../lib/token_status_list", optional = true }
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile.workspace = true

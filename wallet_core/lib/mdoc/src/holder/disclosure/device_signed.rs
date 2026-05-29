@@ -1,0 +1,134 @@
+use coset::CoseMac0Builder;
+use coset::Header;
+use coset::HeaderBuilder;
+use coset::iana;
+use crypto::keys::CredentialEcdsaKey;
+use crypto::wscd::DisclosureWscd;
+use crypto::wscd::WscdPoa;
+use indexmap::IndexMap;
+use p256::PublicKey;
+use p256::SecretKey;
+
+use crate::errors::Result;
+use crate::iso::*;
+use crate::utils::cose::ClonePayload;
+use crate::utils::cose::sign_coses;
+use crate::utils::crypto::dh_hmac_key;
+use crate::utils::serialization::TaggedBytes;
+use crate::utils::serialization::cbor_serialize;
+
+impl DeviceSigned {
+    pub async fn new_signatures<K, W, P>(
+        keys_and_challenges: Vec<(K, &[u8])>,
+        wscd: &W,
+        poa_input: P::Input,
+    ) -> Result<(Vec<DeviceSigned>, Option<P>)>
+    where
+        K: CredentialEcdsaKey,
+        W: DisclosureWscd<Key = K, Poa = P>,
+        P: WscdPoa,
+    {
+        let (coses, poa) = sign_coses(keys_and_challenges, wscd, Header::default(), poa_input, false).await?;
+
+        let signed = coses
+            .into_iter()
+            .map(|cose| DeviceSigned {
+                name_spaces: IndexMap::new().into(),
+                device_auth: DeviceAuth::DeviceSignature(cose.into()),
+            })
+            .collect();
+
+        Ok((signed, poa))
+    }
+
+    pub fn new_mac(
+        private_key: &SecretKey,
+        reader_pub_key: &PublicKey,
+        session_transcript: &SessionTranscript,
+        device_auth: &DeviceAuthenticationBytes,
+    ) -> Result<DeviceSigned> {
+        let key = dh_hmac_key(
+            private_key,
+            reader_pub_key,
+            &cbor_serialize(&TaggedBytes(session_transcript))?,
+            "EMacKey",
+            32,
+        )?;
+
+        let cose = CoseMac0Builder::new()
+            .payload(cbor_serialize(device_auth)?)
+            .protected(HeaderBuilder::new().algorithm(iana::Algorithm::ES256).build())
+            .create_tag(&[], |data| ring::hmac::sign(&key, data).as_ref().into())
+            .build()
+            .clone_without_payload();
+
+        let device_signed = DeviceSigned {
+            name_spaces: IndexMap::new().into(),
+            device_auth: DeviceAuth::DeviceMac(cose.into()),
+        };
+        Ok(device_signed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crypto::examples::Examples;
+    use crypto::server_keys::generate::Ca;
+    use crypto::trust_anchor::TrustAnchors;
+    use p256::SecretKey;
+    use token_status_list::verification::client::mock::StatusListClientStub;
+    use token_status_list::verification::verifier::RevocationVerifier;
+
+    use crate::DeviceAuthenticationBytes;
+    use crate::DeviceSigned;
+    use crate::Document;
+    use crate::examples::Example;
+    use crate::examples::IsoCertTimeGenerator;
+    use crate::holder::Mdoc;
+    use crate::verifier::SupportedAlgorithms;
+
+    #[tokio::test]
+    async fn test_mac_device_signed() {
+        let ca = Ca::generate_issuer_mock_ca().unwrap();
+        let mdoc = Mdoc::new_example_resigned(&ca).await;
+
+        let eph_reader_key = Examples::ephemeral_reader_key();
+        let session_transcript = DeviceAuthenticationBytes::example().0.0.session_transcript;
+
+        // We grab the private key directly from the `Examples` instead of obtaining a `LocalEcdsaKey` from `mdoc`,
+        // because we need to access it directly in this test to convert it to a `SecretKey`.
+        let secret_key = SecretKey::from(Examples::static_device_key().as_nonzero_scalar());
+
+        let mac_device_signed = DeviceSigned::new_mac(
+            &secret_key,
+            &eph_reader_key.public_key(),
+            &session_transcript,
+            &DeviceAuthenticationBytes::example(),
+        )
+        .unwrap();
+
+        let (mso, _, issuer_signed) = mdoc.into_components();
+        let document = Document {
+            doc_type: mso.doc_type,
+            issuer_signed,
+            device_signed: mac_device_signed,
+            errors: None,
+        };
+
+        document
+            .verify(
+                Some(&eph_reader_key),
+                &session_transcript,
+                &IsoCertTimeGenerator,
+                &TrustAnchors::from(&ca),
+                &RevocationVerifier::new_without_caching(Arc::new(StatusListClientStub::new(
+                    ca.generate_status_list_mock().unwrap(),
+                ))),
+                &SupportedAlgorithms::default(),
+            )
+            .await
+            .unwrap();
+    }
+}
