@@ -1,0 +1,244 @@
+use android_attest::attestation_extension::key_attestation::OsVersion;
+use android_attest::attestation_extension::key_attestation::PatchLevel;
+use apple_app_attest::AssertionCounter;
+use chrono::DateTime;
+use chrono::Utc;
+use crypto::p256_der::verifying_key_sha256;
+use derive_more::AsRef;
+use derive_more::Debug;
+use derive_more::Display;
+use derive_more::From;
+use derive_more::Into;
+use hsm::model::encrypted::Encrypted;
+use hsm::model::wrapped_key::WrappedKey;
+use p256::ecdsa::VerifyingKey;
+use semver::Version;
+use serde::Deserialize;
+use serde::Serialize;
+use uuid::Uuid;
+use wallet_account::messages::errors::RevocationReason;
+use wallet_account::messages::transfer::TransferSessionState;
+
+use crate::model::QueryResult;
+
+pub type WalletUserQueryResult = QueryResult<WalletUser>;
+
+#[derive(Debug)]
+pub struct WalletUser {
+    pub id: Uuid,
+    pub wallet_id: WalletId,
+    pub hw_pubkey: VerifyingKey,
+    #[debug(skip)]
+    pub encrypted_pin_pubkey: Encrypted<VerifyingKey>,
+    #[debug(skip)]
+    pub encrypted_previous_pin_pubkey: Option<Encrypted<VerifyingKey>>,
+    pub unsuccessful_pin_entries: u8,
+    pub last_unsuccessful_pin_entry: Option<DateTime<Utc>>,
+    pub instruction_challenge: Option<InstructionChallenge>,
+    pub instruction_sequence_number: u64,
+    pub attestation: WalletUserAttestation,
+    pub state: WalletUserState,
+    pub revocation_code_hmac: Vec<u8>,
+    pub revocation_registration: Option<RevocationRegistration>,
+    pub recovery_code: Option<RecoveryCode>,
+    pub recovery_code_is_denied: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct RevocationRegistration {
+    pub reason: RevocationReason,
+    pub date_time: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub struct TransferSessionSummary {
+    pub transfer_session_id: Uuid,
+    pub state: TransferSessionState,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferSession {
+    pub id: Uuid,
+    pub source_wallet_user_id: Option<Uuid>,
+    pub destination_wallet_user_id: Uuid,
+    pub destination_wallet_recovery_code: String,
+    pub transfer_session_id: Uuid,
+    pub destination_wallet_app_version: Version,
+    pub state: TransferSessionState,
+    pub encrypted_wallet_data: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum WalletUserAttestation {
+    Apple { assertion_counter: AssertionCounter },
+    Android { identifiers: AndroidHardwareIdentifiers },
+}
+
+#[derive(Debug, Default)]
+pub struct AndroidHardwareIdentifiers {
+    pub brand: Option<String>,
+    pub model: Option<String>,
+    pub os_version: Option<OsVersion>,
+    pub os_patch_level: Option<PatchLevel>,
+}
+
+impl WalletUser {
+    pub fn pin_change_in_progress(&self) -> bool {
+        self.encrypted_previous_pin_pubkey.is_some()
+    }
+
+    pub fn transfer_in_progress(&self) -> bool {
+        self.state == WalletUserState::Transferring
+    }
+}
+
+#[derive(Clone, Serialize, Debug)]
+pub struct InstructionChallenge {
+    pub bytes: Vec<u8>,
+    pub expiration_date_time: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub struct WalletUserCreate {
+    pub wallet_id: WalletId,
+    pub hw_pubkey: VerifyingKey,
+    #[debug(skip)]
+    pub encrypted_pin_pubkey: Encrypted<VerifyingKey>,
+    pub attestation_date_time: DateTime<Utc>,
+    pub attestation: WalletUserAttestationCreate,
+    pub revocation_code_hmac: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, strum::Display, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum WalletUserState {
+    Active,
+    Blocked,
+    RecoveringPin,
+    Transferring,
+    Transferred,
+    Revoked,
+}
+
+#[derive(Debug)]
+pub enum WalletUserAttestationCreate {
+    Apple {
+        data: Vec<u8>,
+        assertion_counter: AssertionCounter,
+    },
+    Android {
+        certificate_chain: Vec<Vec<u8>>,
+        integrity_verdict_json: String,
+        identifiers: AndroidHardwareIdentifiers,
+    },
+}
+
+#[derive(Clone)]
+pub struct WalletUserKeys {
+    pub wallet_user_id: Uuid,
+    pub batch_id: Uuid,
+    pub keys: Vec<WalletUserKey>,
+}
+
+#[derive(Clone)]
+pub struct WalletUserKey {
+    pub wallet_user_key_id: Uuid,
+    pub key: WrappedKey,
+    pub is_blocked: bool,
+}
+
+impl WalletUserKey {
+    pub fn sha256_fingerprint(&self) -> String {
+        verifying_key_sha256(self.key.public_key())
+    }
+}
+
+#[derive(Debug, Clone, AsRef, From, Into, Display, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(
+    feature = "utoipa",
+    derive(utoipa::ToSchema),
+    schema(examples("dozCMuQOCEJPtuSNXtB2VkCdaEFNMhEZ"))
+)]
+pub struct WalletId(String);
+
+#[derive(Debug, Clone, AsRef, From, Into, Display, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(
+    feature = "utoipa",
+    derive(utoipa::ToSchema),
+    schema(examples("54aa94af2afc4da286967253a33a61410f0d069c0d77ff748fd83e9fc82c7526"))
+)]
+pub struct RecoveryCode(String);
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct WalletUserIsRevoked {
+    pub wallet_id: WalletId,
+    pub recovery_code: Option<RecoveryCode>,
+    pub state: WalletUserState,
+    pub revocation_registration: Option<RevocationRegistration>,
+    pub can_register_new_wallet: bool,
+}
+
+impl From<WalletUser> for WalletUserIsRevoked {
+    fn from(wallet_user: WalletUser) -> Self {
+        Self {
+            wallet_id: wallet_user.wallet_id,
+            recovery_code: wallet_user.recovery_code,
+            state: wallet_user.state,
+            revocation_registration: wallet_user.revocation_registration,
+            can_register_new_wallet: !wallet_user.recovery_code_is_denied,
+        }
+    }
+}
+
+#[cfg(feature = "mock")]
+pub mod mock {
+    use std::str::FromStr;
+
+    use crypto::utils::random_bytes;
+    use hsm::model::encrypted::Encrypted;
+    use hsm::model::encrypted::InitializationVector;
+    use p256::ecdsa::VerifyingKey;
+    use uuid::uuid;
+
+    use super::AndroidHardwareIdentifiers;
+    use super::WalletUser;
+    use super::WalletUserAttestation;
+    use super::WalletUserState;
+    use crate::model::wallet_user::WalletId;
+
+    pub fn wallet_user_1() -> WalletUser {
+        wallet_user_with_id("wallet_123".to_owned().into())
+    }
+
+    pub fn wallet_user_with_id(wallet_id: WalletId) -> WalletUser {
+        WalletUser {
+            id: uuid!("d944f36e-ffbd-402f-b6f3-418cf4c49e08"),
+            wallet_id,
+            hw_pubkey: VerifyingKey::from_str(
+                r#"-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhaPRcKTAS30m0409bpOzQLfLNOh5
+SssTb0eI53lvfdvG/xkNcktwsXEIPL1y3lUKn1u1ZhFTnQn4QKmnvaN4uQ==
+-----END PUBLIC KEY-----
+"#,
+            )
+            .unwrap(),
+            encrypted_pin_pubkey: Encrypted::new(random_bytes(32), InitializationVector(random_bytes(32))),
+            encrypted_previous_pin_pubkey: None,
+            unsuccessful_pin_entries: 0,
+            last_unsuccessful_pin_entry: None,
+            instruction_challenge: None,
+            instruction_sequence_number: 0,
+            attestation: WalletUserAttestation::Android {
+                identifiers: AndroidHardwareIdentifiers::default(),
+            },
+            state: WalletUserState::Active,
+            revocation_code_hmac: random_bytes(32),
+            revocation_registration: None,
+            recovery_code: None,
+            recovery_code_is_denied: false,
+        }
+    }
+}

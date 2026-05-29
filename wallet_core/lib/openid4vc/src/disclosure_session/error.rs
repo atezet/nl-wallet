@@ -1,0 +1,152 @@
+use std::error::Error;
+
+use attestation_data::auth::reader_auth::ValidationError;
+use attestation_data::x509::CertificateTypeError;
+use dcql::CredentialFormat;
+use derive_more::Constructor;
+use derive_more::Display;
+use error_category::ErrorCategory;
+
+use super::VpMessageClientError;
+use super::uri_source::DisclosureUriSource;
+use crate::openid4vp::AuthRequestValidationError;
+use crate::openid4vp::AuthResponseError;
+use crate::verifier::SessionType;
+
+#[derive(Debug, thiserror::Error, ErrorCategory)]
+#[category(defer)]
+pub enum VpSessionError {
+    #[error("{0}")]
+    Client(#[from] VpClientError),
+
+    #[error("{0}")]
+    Verifier(#[from] VpVerifierError),
+}
+
+impl From<VpMessageClientError> for VpSessionError {
+    fn from(source: VpMessageClientError) -> Self {
+        match &source {
+            VpMessageClientError::Json(_) | VpMessageClientError::InvalidJwt(_) => {
+                VpSessionError::Verifier(VpVerifierError::Request(source))
+            }
+            _ => VpSessionError::Client(VpClientError::Request(source)),
+        }
+    }
+}
+
+impl From<AuthRequestValidationError> for VpSessionError {
+    fn from(source: AuthRequestValidationError) -> Self {
+        VpSessionError::Verifier(VpVerifierError::AuthRequestValidation(source))
+    }
+}
+
+#[derive(Debug, thiserror::Error, ErrorCategory)]
+#[category(defer)]
+pub enum VpClientError {
+    #[error("error deserializing request_uri object: {0}")]
+    // we cannot be sure that the URL is not included in the error.
+    #[category(pd)]
+    RequestUri(#[source] serde_urlencoded::de::Error),
+
+    #[error("unsupported OpenID4VP authorization request URI variant: {0}")]
+    #[category(critical)]
+    UnsupportedRequestUriVariant(UnsupportedRequestUriVariant),
+
+    #[error("mismatch between session type and disclosure URI source: {0} not allowed from {1}")]
+    #[category(critical)]
+    DisclosureUriSourceMismatch(SessionType, DisclosureUriSource),
+
+    #[error("error sending OpenID4VP message: {0}")]
+    Request(#[source] VpMessageClientError),
+
+    #[error("received credential request with mix of formats from verifier, this is unsupported")]
+    #[category(critical)]
+    MixedFormatCredentialRequest,
+
+    #[error("error creating mdoc device response: {0}")]
+    DeviceResponse(#[source] mdoc::Error),
+
+    #[error("error signing SD-JWT presentation: {0}")]
+    #[category(pd)]
+    SdJwtSigning(#[source] sd_jwt::error::SigningError),
+
+    #[error("error encrypting Authorization Response: {0}")]
+    AuthResponseEncryption(#[source] AuthResponseError),
+}
+
+#[derive(Debug, thiserror::Error, ErrorCategory)]
+#[category(defer)]
+pub enum VpVerifierError {
+    #[error("error sending OpenID4VP message: {0}")]
+    Request(#[source] VpMessageClientError),
+
+    #[error("error verifying Authorization Request: {0}")]
+    AuthRequestValidation(#[source] AuthRequestValidationError),
+
+    #[error("incorrect client_id: expected {expected}, found {found}")]
+    #[category(critical)]
+    IncorrectClientId { expected: String, found: String },
+
+    #[error("error parsing RP certificate: {0}")]
+    RpCertificate(#[source] CertificateTypeError),
+
+    #[error("RP certificate is not a reader certificate")]
+    #[category(critical)]
+    NoReaderCertificate,
+
+    #[error("error validating requested attributes: {0}")]
+    RequestedAttributesValidation(#[source] ValidationError),
+
+    #[error("verifier vp_formats_supported does not include required algorithm for format {0}")]
+    #[category(critical)]
+    VpFormatsNotSupported(CredentialFormat),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnsupportedRequestUriVariant {
+    #[error("request object as value is not supported")]
+    RequestObjectAsValue,
+    #[error("request object as query parameters is not supported")]
+    RequestObjectAsQueryParameters,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+pub enum DataDisclosed {
+    Disclosed,
+    NotDisclosed,
+}
+
+#[derive(Debug, Constructor, thiserror::Error)]
+#[error("could not perform actual disclosure, attributes were shared: {data_shared}, error: {error}")]
+pub struct DisclosureError<E: Error> {
+    pub data_shared: DataDisclosed,
+    #[source]
+    pub error: E,
+}
+
+impl<E: Error> DisclosureError<E> {
+    pub fn before_sharing(error: E) -> Self {
+        Self {
+            data_shared: DataDisclosed::NotDisclosed,
+            error,
+        }
+    }
+
+    pub fn after_sharing(error: E) -> Self {
+        Self {
+            data_shared: DataDisclosed::Disclosed,
+            error,
+        }
+    }
+}
+
+impl From<VpMessageClientError> for DisclosureError<VpSessionError> {
+    fn from(value: VpMessageClientError) -> Self {
+        let data_shared = match &value {
+            VpMessageClientError::Http(reqwest_error) if reqwest_error.is_connect() => DataDisclosed::NotDisclosed,
+            _ => DataDisclosed::Disclosed,
+        };
+
+        Self::new(data_shared, value.into())
+    }
+}

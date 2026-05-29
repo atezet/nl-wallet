@@ -1,0 +1,1245 @@
+use std::cmp::Ordering;
+use std::ops::Add;
+use std::ops::Sub;
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::Result;
+use assert_cmd::prelude::*;
+use assert_fs::TempDir;
+use assert_fs::fixture::ChildPath;
+use assert_fs::prelude::*;
+use attestation_data::auth::issuer_auth::IssuerRegistration;
+use attestation_data::auth::reader_auth::ReaderRegistration;
+use crypto::x509::CertificateUsage;
+use p256::ecdsa::SigningKey;
+use p256::pkcs8::DecodePrivateKey;
+use p256::pkcs8::EncodePublicKey;
+use p256::pkcs8::spki::DynAssociatedAlgorithmIdentifier;
+use p256::pkcs8::spki::ObjectIdentifier;
+use pem::EncodeConfig;
+use pem::LineEnding;
+use pem::Pem;
+use predicates::prelude::*;
+use predicates::str::RegexPredicate;
+use predicates::str::StartsWithPredicate;
+use rand_core::OsRng;
+use time::Duration;
+use time::OffsetDateTime;
+use x509_parser::oid_registry::OID_KEY_TYPE_EC_PUBLIC_KEY;
+
+trait RangeCompare<Offset> {
+    /// Compare [`self`] to the range of [`other`] +/- the [`offset`].
+    fn cmp_range(&self, other: &Self, offset: Offset) -> Ordering;
+}
+
+impl<T, R> RangeCompare<R> for T
+where
+    T: Add<R, Output = Self>,
+    T: Sub<R, Output = Self>,
+    T: Ord,
+    T: Copy,
+    R: Copy,
+{
+    // This comparison is performed inclusive on the bounds.
+    fn cmp_range(&self, other: &Self, offset: R) -> Ordering {
+        if self.cmp(&(*other - offset)) == Ordering::Less {
+            return Ordering::Less;
+        }
+        if self.cmp(&(*other + offset)) == Ordering::Greater {
+            return Ordering::Greater;
+        }
+        Ordering::Equal
+    }
+}
+
+fn predicate_successfully_generated_key_pair(crt: &Path, key: &Path) -> Result<RegexPredicate> {
+    let result = predicate::str::is_match(format!(
+        "Certificate stored in '{}'\nKey stored in '{}'",
+        crt.display(),
+        key.display(),
+    ))?;
+    Ok(result)
+}
+
+fn predicate_successfully_generated_certificate(crt: &Path) -> Result<RegexPredicate> {
+    let result = predicate::str::is_match(format!("Certificate stored in '{}'", crt.display(),))?;
+    Ok(result)
+}
+
+fn predicate_file_already_exists(path: &Path) -> Result<RegexPredicate> {
+    let result = predicate::str::is_match(format!("Error: Target file '{}' already exists\n", path.display()))?;
+    Ok(result)
+}
+
+fn predicate_missing_reader_json_file(path: &Path) -> StartsWithPredicate {
+    predicate::str::starts_with(format!(
+        "error: Invalid value for --reader-auth-file <READER_AUTH_FILE>: Could not open \"{}\": No such file or \
+         directory",
+        path.display()
+    ))
+}
+
+fn predicate_missing_issuer_json_file(path: &Path) -> StartsWithPredicate {
+    predicate::str::starts_with(format!(
+        "error: Invalid value for --issuer-auth-file <ISSUER_AUTH_FILE>: Could not open \"{}\": No such file or \
+         directory",
+        path.display()
+    ))
+}
+
+fn predicate_missing_crt_file(path: &Path) -> StartsWithPredicate {
+    predicate::str::starts_with(format!(
+        r#"error: Invalid value for --ca-crt-file <CA_CRT_FILE>: Could not open "{}": No such file or directory"#,
+        path.display()
+    ))
+}
+
+fn predicate_missing_key_file(path: &Path) -> StartsWithPredicate {
+    predicate::str::starts_with(format!(
+        r#"error: Invalid value for --ca-key-file <CA_KEY_FILE>: Could not open "{}": No such file or directory"#,
+        path.display()
+    ))
+}
+
+fn predicate_missing_public_key_file(path: &Path) -> StartsWithPredicate {
+    predicate::str::starts_with(format!(
+        r#"error: Invalid value for --public-key-file <PUBLIC_KEY_FILE>: Could not open "{}": No such file or directory"#,
+        path.display()
+    ))
+}
+
+fn assert_generated_key(key_file: &ChildPath) -> Result<()> {
+    // Read key and verify algorithm
+    SigningKey::read_pkcs8_pem_file(key_file)?
+        .algorithm_identifier()?
+        .assert_algorithm_oid(ObjectIdentifier::new_unwrap(&OID_KEY_TYPE_EC_PUBLIC_KEY.to_id_string()))?;
+
+    Ok(())
+}
+
+fn assert_generated_certificate(
+    crt_file: &ChildPath,
+    expected_cn: &str,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    usage: Option<CertificateUsage>,
+) -> Result<()> {
+    // Read certificate and verify PEM label
+    let crt_pem_bytes = std::fs::read(crt_file)?;
+    let (_, crt_pem) = x509_parser::pem::parse_x509_pem(&crt_pem_bytes)?;
+    assert_eq!(crt_pem.label, "CERTIFICATE");
+    let crt = crt_pem.parse_x509()?;
+
+    // verify CN
+    itertools::assert_equal(
+        crt.subject().iter_common_name().map(|a| a.as_str().unwrap()),
+        vec![expected_cn],
+    );
+
+    // verify validity times with minute accuracy
+    let not_before = crt.validity().not_before.to_datetime();
+    assert_eq!(not_before.cmp_range(&start, Duration::minutes(1)), Ordering::Equal);
+    let not_after = crt.validity().not_after.to_datetime();
+    assert_eq!(not_after.cmp_range(&end, Duration::minutes(1)), Ordering::Equal);
+
+    // verify usage
+    if let Some(usage) = usage {
+        assert_eq!(CertificateUsage::from_certificate(&crt)?, usage);
+    }
+
+    Ok(())
+}
+
+trait CommandExtension {
+    fn generate_ca(&mut self, file_prefix: &Path) -> &mut Self;
+    fn generate_issuer_kp(
+        &mut self,
+        ca_crt: &Path,
+        ca_key: &Path,
+        issuer_auth_json: &Path,
+        file_prefix: &Path,
+    ) -> &mut Self;
+    fn generate_reader_kp(
+        &mut self,
+        ca_crt: &Path,
+        ca_key: &Path,
+        rp_auth_json: &Path,
+        file_prefix: &Path,
+    ) -> &mut Self;
+    fn generate_tsl_kp(&mut self, ca_crt: &Path, ca_key: &Path, file_prefix: &Path) -> &mut Self;
+    fn generate_issuer_cert(
+        &mut self,
+        pk: &Path,
+        ca_crt: &Path,
+        ca_key: &Path,
+        issuer_auth_json: &Path,
+        file_prefix: &Path,
+    ) -> &mut Self;
+    fn generate_reader_cert(
+        &mut self,
+        pk: &Path,
+        ca_crt: &Path,
+        ca_key: &Path,
+        rp_auth_json: &Path,
+        file_prefix: &Path,
+    ) -> &mut Self;
+    fn generate_tsl_cert(&mut self, pk: &Path, ca_crt: &Path, ca_key: &Path, file_prefix: &Path) -> &mut Self;
+}
+
+impl CommandExtension for Command {
+    fn generate_ca(&mut self, file_prefix: &Path) -> &mut Self {
+        self.arg("ca")
+            .arg("--common-name")
+            .arg("test-ca")
+            .arg("--file-prefix")
+            .arg(file_prefix)
+    }
+
+    fn generate_issuer_kp(
+        &mut self,
+        ca_crt: &Path,
+        ca_key: &Path,
+        issuer_auth_json: &Path,
+        file_prefix: &Path,
+    ) -> &mut Self {
+        self.arg("issuer")
+            .arg("--ca-key-file")
+            .arg(ca_key)
+            .arg("--ca-crt-file")
+            .arg(ca_crt)
+            .arg("--common-name")
+            .arg("test-mdl-kp")
+            .arg("--file-prefix")
+            .arg(file_prefix)
+            .arg("--issuer-auth-file")
+            .arg(issuer_auth_json)
+    }
+
+    fn generate_reader_kp(
+        &mut self,
+        ca_crt: &Path,
+        ca_key: &Path,
+        rp_auth_json: &Path,
+        file_prefix: &Path,
+    ) -> &mut Self {
+        self.arg("reader")
+            .arg("--ca-key-file")
+            .arg(ca_key)
+            .arg("--ca-crt-file")
+            .arg(ca_crt)
+            .arg("--common-name")
+            .arg("test-reader-auth-kp")
+            .arg("--file-prefix")
+            .arg(file_prefix)
+            .arg("--reader-auth-file")
+            .arg(rp_auth_json)
+    }
+
+    fn generate_tsl_kp(&mut self, ca_crt: &Path, ca_key: &Path, file_prefix: &Path) -> &mut Self {
+        self.arg("tsl")
+            .arg("--ca-key-file")
+            .arg(ca_key)
+            .arg("--ca-crt-file")
+            .arg(ca_crt)
+            .arg("--common-name")
+            .arg("test-tsl-kp")
+            .arg("--file-prefix")
+            .arg(file_prefix)
+    }
+
+    fn generate_issuer_cert(
+        &mut self,
+        pk: &Path,
+        ca_crt: &Path,
+        ca_key: &Path,
+        issuer_auth_json: &Path,
+        file_prefix: &Path,
+    ) -> &mut Self {
+        self.arg("issuer-cert")
+            .arg("--public-key-file")
+            .arg(pk)
+            .arg("--ca-key-file")
+            .arg(ca_key)
+            .arg("--ca-crt-file")
+            .arg(ca_crt)
+            .arg("--common-name")
+            .arg("test-mdl-crt")
+            .arg("--file-prefix")
+            .arg(file_prefix)
+            .arg("--issuer-auth-file")
+            .arg(issuer_auth_json)
+    }
+
+    fn generate_reader_cert(
+        &mut self,
+        pk: &Path,
+        ca_crt: &Path,
+        ca_key: &Path,
+        rp_auth_json: &Path,
+        file_prefix: &Path,
+    ) -> &mut Self {
+        self.arg("reader-cert")
+            .arg("--public-key-file")
+            .arg(pk)
+            .arg("--ca-key-file")
+            .arg(ca_key)
+            .arg("--ca-crt-file")
+            .arg(ca_crt)
+            .arg("--common-name")
+            .arg("test-reader-auth-crt")
+            .arg("--file-prefix")
+            .arg(file_prefix)
+            .arg("--reader-auth-file")
+            .arg(rp_auth_json)
+    }
+
+    fn generate_tsl_cert(&mut self, pk: &Path, ca_crt: &Path, ca_key: &Path, file_prefix: &Path) -> &mut Self {
+        self.arg("tsl-cert")
+            .arg("--public-key-file")
+            .arg(pk)
+            .arg("--ca-key-file")
+            .arg(ca_key)
+            .arg("--ca-crt-file")
+            .arg(ca_crt)
+            .arg("--common-name")
+            .arg("test-tsl-crt")
+            .arg("--file-prefix")
+            .arg(file_prefix)
+    }
+}
+
+fn keypair_paths(temp: &TempDir, prefix: &str) -> (ChildPath, ChildPath, ChildPath) {
+    (
+        temp.child(prefix),
+        temp.child(format!("{prefix}.crt.pem")),
+        temp.child(format!("{prefix}.key.pem")),
+    )
+}
+
+fn public_key_path(temp: &TempDir, prefix: &str) -> ChildPath {
+    temp.child(format!("{prefix}.pk.pem"))
+}
+
+fn generate_public_key(path: &ChildPath) {
+    let signing_key = SigningKey::random(&mut OsRng);
+    let public_key = signing_key.verifying_key();
+    let der = public_key.to_public_key_der().unwrap();
+    let pem = Pem::new("PUBLIC KEY", der.to_vec());
+    std::fs::write(
+        path,
+        pem::encode_config(&pem, EncodeConfig::new().set_line_ending(LineEnding::LF)),
+    )
+    .unwrap();
+}
+
+#[test]
+fn happy_flow_with_default_lifetime() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(&temp, "test-ca");
+
+    let expected_lifetime = Duration::days(365);
+
+    // Generate ca and assert success and stderr output
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .assert()
+        .success()
+        .stderr(predicate_successfully_generated_key_pair(&ca_crt, &ca_key)?);
+
+    // Assert generated ca files
+    assert_generated_key(&ca_key)?;
+    assert_generated_certificate(
+        &ca_crt,
+        "test-ca",
+        OffsetDateTime::now_utc(),
+        OffsetDateTime::now_utc() + expected_lifetime,
+        None,
+    )?;
+
+    // Generate issuer key pair
+    {
+        let (mdl_prefix, mdl_crt, mdl_key) = keypair_paths(&temp, "test-mdl-kp");
+        let issuer_auth_json = temp.child("test-issuer-auth.json");
+
+        // Generate issuer registration JSON input file
+        issuer_auth_json.write_str(&serde_json::to_string(&IssuerRegistration::new_mock())?)?;
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_key_pair(&mdl_crt, &mdl_key)?);
+
+        // Assert generated issuer files
+        assert_generated_key(&mdl_key)?;
+        assert_generated_certificate(
+            &mdl_crt,
+            "test-mdl-kp",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + expected_lifetime,
+            Some(CertificateUsage::Mdl),
+        )?;
+    }
+
+    // Generate issuer certificate
+    {
+        let (mdl_prefix, mdl_crt, _) = keypair_paths(&temp, "test-mdl-crt");
+        let issuer_auth_json = temp.child("test-issuer-auth.json");
+
+        // Generate issuer registration JSON input file
+        issuer_auth_json.write_str(&serde_json::to_string(&IssuerRegistration::new_mock())?)?;
+
+        let public_key_path = public_key_path(&temp, "test-mdl-crt");
+        generate_public_key(&public_key_path);
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_issuer_cert(&public_key_path, &ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_certificate(&mdl_crt)?);
+
+        // Assert generated issuer certificate
+        assert_generated_certificate(
+            &mdl_crt,
+            "test-mdl-crt",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + expected_lifetime,
+            Some(CertificateUsage::Mdl),
+        )?;
+    }
+
+    // Generate reader key pair
+    {
+        let (rp_auth_prefix, rp_auth_crt, rp_auth_key) = keypair_paths(&temp, "test-reader-auth-kp");
+        let rp_auth_json = temp.child("test-reader-auth.json");
+
+        // Generate reader registration JSON input file
+        rp_auth_json.write_str(&serde_json::to_string(&ReaderRegistration::new_mock())?)?;
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_key_pair(&rp_auth_crt, &rp_auth_key)?);
+
+        // Assert generated reader files
+        assert_generated_key(&rp_auth_key)?;
+        assert_generated_certificate(
+            &rp_auth_crt,
+            "test-reader-auth-kp",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + expected_lifetime,
+            Some(CertificateUsage::ReaderAuth),
+        )?;
+    }
+
+    // Generate reader certificate
+    {
+        let (rp_auth_prefix, rp_auth_crt, _) = keypair_paths(&temp, "test-reader-auth-crt");
+        let rp_auth_json = temp.child("test-reader-auth.json");
+
+        // Generate reader registration JSON input file
+        rp_auth_json.write_str(&serde_json::to_string(&ReaderRegistration::new_mock())?)?;
+
+        let public_key_path = public_key_path(&temp, "test-reader-auth-crt");
+        generate_public_key(&public_key_path);
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_reader_cert(&public_key_path, &ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_certificate(&rp_auth_crt)?);
+
+        // Assert generated reader certificate
+        assert_generated_certificate(
+            &rp_auth_crt,
+            "test-reader-auth-crt",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + expected_lifetime,
+            Some(CertificateUsage::ReaderAuth),
+        )?;
+    }
+
+    // Generate tsl key pair
+    {
+        let (tsl_prefix, tsl_crt, tsl_key) = keypair_paths(&temp, "test-tsl-kp");
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_tsl_kp(&ca_crt, &ca_key, &tsl_prefix)
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_key_pair(&tsl_crt, &tsl_key)?);
+
+        // Assert generated reader files
+        assert_generated_key(&tsl_key)?;
+        assert_generated_certificate(
+            &tsl_crt,
+            "test-tsl-kp",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + expected_lifetime,
+            Some(CertificateUsage::OAuthStatusSigning),
+        )?;
+    }
+
+    // Generate tsl certificate
+    {
+        let (tsl_prefix, tsl_crt, _) = keypair_paths(&temp, "test-tsl-crt");
+
+        let public_key_path = public_key_path(&temp, "test-tsl-crt");
+        generate_public_key(&public_key_path);
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_tsl_cert(&public_key_path, &ca_crt, &ca_key, &tsl_prefix)
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_certificate(&tsl_crt)?);
+
+        // Assert generated reader certificate
+        assert_generated_certificate(
+            &tsl_crt,
+            "test-tsl-crt",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + expected_lifetime,
+            Some(CertificateUsage::OAuthStatusSigning),
+        )?;
+    }
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn happy_flow_with_custom_lifetime() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(&temp, "test-ca");
+
+    // Generate ca and assert success and stderr output
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .arg("--days")
+        .arg("586")
+        .assert()
+        .success()
+        .stderr(predicate_successfully_generated_key_pair(&ca_crt, &ca_key)?);
+
+    // Assert generated ca files
+    assert_generated_key(&ca_key)?;
+    assert_generated_certificate(
+        &ca_crt,
+        "test-ca",
+        OffsetDateTime::now_utc(),
+        OffsetDateTime::now_utc() + Duration::days(586),
+        None,
+    )?;
+
+    // Generate issuer key pair
+    {
+        let (mdl_prefix, mdl_crt, mdl_key) = keypair_paths(&temp, "test-mdl-kp");
+        let issuer_auth_json = temp.child("test-issuer-auth.json");
+
+        // Generate issuer registration JSON input file
+        issuer_auth_json.write_str(&serde_json::to_string(&IssuerRegistration::new_mock())?)?;
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+            .arg("--days=678")
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_key_pair(&mdl_crt, &mdl_key)?);
+
+        // Assert generated issuer files
+        assert_generated_key(&mdl_key)?;
+        assert_generated_certificate(
+            &mdl_crt,
+            "test-mdl-kp",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + Duration::days(678),
+            Some(CertificateUsage::Mdl),
+        )?;
+    }
+
+    // Generate issuer certificate
+    {
+        let (mdl_prefix, mdl_crt, _) = keypair_paths(&temp, "test-mdl-crt");
+        let issuer_auth_json = temp.child("test-issuer-auth.json");
+
+        // Generate issuer registration JSON input file
+        issuer_auth_json.write_str(&serde_json::to_string(&IssuerRegistration::new_mock())?)?;
+
+        let public_key_path = public_key_path(&temp, "test-mdl-crt");
+        generate_public_key(&public_key_path);
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_issuer_cert(&public_key_path, &ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+            .arg("--days=678")
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_certificate(&mdl_crt)?);
+
+        // Assert generated issuer certificate
+        assert_generated_certificate(
+            &mdl_crt,
+            "test-mdl-crt",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + Duration::days(678),
+            Some(CertificateUsage::Mdl),
+        )?;
+    }
+
+    // Generate reader key pair
+    {
+        let (rp_auth_prefix, rp_auth_crt, rp_auth_key) = keypair_paths(&temp, "test-reader-auth-kp");
+        let rp_auth_json = temp.child("test-reader-auth.json");
+
+        // Generate reader JSON input file
+        rp_auth_json.write_str(&serde_json::to_string(&ReaderRegistration::new_mock())?)?;
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+            .arg("--days")
+            .arg("7")
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_key_pair(&rp_auth_crt, &rp_auth_key)?);
+
+        // Assert generated reader files
+        assert_generated_key(&rp_auth_key)?;
+        assert_generated_certificate(
+            &rp_auth_crt,
+            "test-reader-auth-kp",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + Duration::days(7),
+            Some(CertificateUsage::ReaderAuth),
+        )?;
+    }
+
+    // Generate reader certificate
+    {
+        let (rp_auth_prefix, rp_auth_crt, _) = keypair_paths(&temp, "test-reader-auth-crt");
+        let rp_auth_json = temp.child("test-reader-auth.json");
+
+        // Generate reader registration JSON input file
+        rp_auth_json.write_str(&serde_json::to_string(&ReaderRegistration::new_mock())?)?;
+
+        let public_key_path = public_key_path(&temp, "test-reader-auth-crt");
+        generate_public_key(&public_key_path);
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_reader_cert(&public_key_path, &ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+            .arg("--days")
+            .arg("7")
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_certificate(&rp_auth_crt)?);
+
+        // Assert generated reader certificate
+        assert_generated_certificate(
+            &rp_auth_crt,
+            "test-reader-auth-crt",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + Duration::days(7),
+            Some(CertificateUsage::ReaderAuth),
+        )?;
+    }
+
+    // Generate tsl key pair
+    {
+        let (tsl_prefix, tsl_crt, tsl_key) = keypair_paths(&temp, "test-tsl-kp");
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_tsl_kp(&ca_crt, &ca_key, &tsl_prefix)
+            .arg("--days")
+            .arg("7")
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_key_pair(&tsl_crt, &tsl_key)?);
+
+        // Assert generated reader files
+        assert_generated_key(&tsl_key)?;
+        assert_generated_certificate(
+            &tsl_crt,
+            "test-tsl-kp",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + Duration::days(7),
+            Some(CertificateUsage::OAuthStatusSigning),
+        )?;
+    }
+
+    // Generate tsl certificate
+    {
+        let (tsl_prefix, tsl_crt, _) = keypair_paths(&temp, "test-tsl-crt");
+
+        let public_key_path = public_key_path(&temp, "test-tsl-crt");
+        generate_public_key(&public_key_path);
+
+        // Execute command and assert success and stderr output
+        Command::new(assert_cmd::cargo::cargo_bin!())
+            .generate_tsl_cert(&public_key_path, &ca_crt, &ca_key, &tsl_prefix)
+            .arg("--days")
+            .arg("7")
+            .assert()
+            .success()
+            .stderr(predicate_successfully_generated_certificate(&tsl_crt)?);
+
+        // Assert generated reader certificate
+        assert_generated_certificate(
+            &tsl_crt,
+            "test-tsl-crt",
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + Duration::days(7),
+            Some(CertificateUsage::OAuthStatusSigning),
+        )?;
+    }
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn regenerating_ca() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(&temp, "test-ca");
+
+    // Generate ca and assert success
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .assert()
+        .success();
+
+    // Re-generate ca should fail on key
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_file_already_exists(&ca_key)?);
+
+    // Re-generate ca should fail on crt when key is deleted
+    std::fs::remove_file(&ca_key)?;
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_file_already_exists(&ca_crt)?);
+
+    // Re-generate ca should succeed with force flag
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .arg("--force")
+        .assert()
+        .success();
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn regenerating_mdl() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(&temp, "test-ca");
+
+    // Generate ca and assert success
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .assert()
+        .success();
+
+    let (mdl_prefix, mdl_crt, mdl_key) = keypair_paths(&temp, "test-mdl-kp");
+    let issuer_auth_json = temp.child("test-issuer-auth.json");
+
+    // Generate reader JSON input file
+    issuer_auth_json.write_str(&serde_json::to_string(&IssuerRegistration::new_mock())?)?;
+
+    // Generate issuer key pair and assert success
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .success();
+
+    // Regenerate issuer key pair should fail on key
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_file_already_exists(&mdl_key)?);
+
+    // Regenerate issuer key pair should fail on crt when key is deleted
+    std::fs::remove_file(&mdl_key)?;
+
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_file_already_exists(&mdl_crt)?);
+
+    // Regenerate issuer key pair should succeed with force
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .arg("--force")
+        .assert()
+        .success();
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn regenerating_rp_auth() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(&temp, "test-ca");
+
+    // Generate ca and assert success
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .assert()
+        .success();
+
+    let (rp_auth_prefix, rp_auth_crt, rp_auth_key) = keypair_paths(&temp, "test-reader-auth-kp");
+    let rp_auth_json = temp.child("test-reader-auth.json");
+
+    // Generate reader JSON input file
+    rp_auth_json.write_str(&serde_json::to_string(&ReaderRegistration::new_mock())?)?;
+
+    // Generate reader key pair and assert success
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .success();
+
+    // Regenerate reader key pair should fail on key
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_file_already_exists(&rp_auth_key)?);
+
+    // Regenerate reader key pair should fail on crt when key is deleted
+    std::fs::remove_file(&rp_auth_key)?;
+
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_file_already_exists(&rp_auth_crt)?);
+
+    // Regenerate reader key pair should succeed with force
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .arg("--force")
+        .assert()
+        .success();
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn regenerating_tsl() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(&temp, "test-ca");
+
+    // Generate ca and assert success
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .assert()
+        .success();
+
+    let (tsl_prefix, tsl_crt, tsl_key) = keypair_paths(&temp, "test-tsl-kp");
+
+    // Generate reader key pair and assert success
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_kp(&ca_crt, &ca_key, &tsl_prefix)
+        .assert()
+        .success();
+
+    // Regenerate reader key pair should fail on key
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_kp(&ca_crt, &ca_key, &tsl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_file_already_exists(&tsl_key)?);
+
+    // Regenerate reader key pair should fail on crt when key is deleted
+    std::fs::remove_file(&tsl_key)?;
+
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_kp(&ca_crt, &ca_key, &tsl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_file_already_exists(&tsl_crt)?);
+
+    // Regenerate reader key pair should succeed with force
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_kp(&ca_crt, &ca_key, &tsl_prefix)
+        .arg("--force")
+        .assert()
+        .success();
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+fn setup_issuer_files(temp: &TempDir) -> Result<(ChildPath, ChildPath, ChildPath, ChildPath)> {
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(temp, "test-ca");
+    let (mdl_prefix, _mdl_crt, _mdl_key) = keypair_paths(temp, "test-mdl-kp");
+    let issuer_auth_json = temp.child("test-issuer-auth.json");
+
+    // Generate ca
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .arg("--force")
+        .assert()
+        .success();
+
+    // Generate issuer registration JSON input file
+    issuer_auth_json.write_str(&serde_json::to_string(&IssuerRegistration::new_mock())?)?;
+
+    Ok((ca_crt, ca_key, mdl_prefix, issuer_auth_json))
+}
+
+fn setup_issuer_pubkey_files(temp: &TempDir) -> Result<(ChildPath, ChildPath, ChildPath, ChildPath, ChildPath)> {
+    let (ca_crt, ca_key, mdl_prefix, issuer_auth_json) = setup_issuer_files(temp)?;
+
+    let public_key_path = public_key_path(temp, "test-mdl-crt");
+    generate_public_key(&public_key_path);
+
+    Ok((public_key_path, ca_crt, ca_key, mdl_prefix, issuer_auth_json))
+}
+
+#[test]
+fn missing_input_files_issuer() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    // Setup files without CA key
+    let (ca_crt, ca_key, mdl_prefix, issuer_auth_json) = setup_issuer_files(&temp)?;
+    std::fs::remove_file(&ca_key)?;
+
+    // Generate issuer should fail when missing CA key file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_key_file(&ca_key));
+
+    // Setup files without CA crt
+    let (ca_crt, ca_key, mdl_prefix, issuer_auth_json) = setup_issuer_files(&temp)?;
+    std::fs::remove_file(&ca_crt)?;
+
+    // Execute command and assert failure and stderr output
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_crt_file(&ca_crt));
+
+    // Setup files without issuer registration JSON file
+    let (ca_crt, ca_key, mdl_prefix, issuer_auth_json) = setup_issuer_files(&temp)?;
+    std::fs::remove_file(&issuer_auth_json)?;
+
+    // Generate issuer should fail when missing JSON file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_kp(&ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_issuer_json_file(&issuer_auth_json));
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn missing_input_files_issuer_pubkey() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    // Setup files without CA key
+    let (public_key_file, ca_crt, ca_key, mdl_prefix, issuer_auth_json) = setup_issuer_pubkey_files(&temp)?;
+    std::fs::remove_file(&ca_key)?;
+
+    // Generate issuer should fail when missing CA key file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_cert(&public_key_file, &ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_key_file(&ca_key));
+
+    // Setup files without CA crt
+    let (public_key_file, ca_crt, ca_key, mdl_prefix, issuer_auth_json) = setup_issuer_pubkey_files(&temp)?;
+    std::fs::remove_file(&ca_crt)?;
+
+    // Execute command and assert failure and stderr output
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_cert(&public_key_file, &ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_crt_file(&ca_crt));
+
+    // Setup files without issuer registration JSON file
+    let (public_key_file, ca_crt, ca_key, mdl_prefix, issuer_auth_json) = setup_issuer_pubkey_files(&temp)?;
+    std::fs::remove_file(&issuer_auth_json)?;
+
+    // Generate issuer should fail when missing JSON file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_cert(&public_key_file, &ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_issuer_json_file(&issuer_auth_json));
+
+    // Setup files without public key file
+    let (public_key_file, ca_crt, ca_key, mdl_prefix, issuer_auth_json) = setup_issuer_pubkey_files(&temp)?;
+    std::fs::remove_file(&public_key_file)?;
+
+    // Generate issuer should fail when missing JSON file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_issuer_cert(&public_key_file, &ca_crt, &ca_key, &issuer_auth_json, &mdl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_public_key_file(&public_key_file));
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+fn setup_reader_files(temp: &TempDir) -> Result<(ChildPath, ChildPath, ChildPath, ChildPath)> {
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(temp, "test-ca");
+    let (rp_auth_prefix, _rp_auth_crt, _rp_auth_key) = keypair_paths(temp, "test-reader-auth-kp");
+    let rp_auth_json = temp.child("test-reader-auth.json");
+
+    // Generate ca
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .arg("--force")
+        .assert()
+        .success();
+
+    // Generate reader registration JSON input file
+    rp_auth_json.write_str(&serde_json::to_string(&ReaderRegistration::new_mock())?)?;
+
+    Ok((ca_crt, ca_key, rp_auth_prefix, rp_auth_json))
+}
+
+fn setup_reader_pubkey_files(temp: &TempDir) -> Result<(ChildPath, ChildPath, ChildPath, ChildPath, ChildPath)> {
+    let (ca_crt, ca_key, rp_auth_prefix, rp_auth_json) = setup_reader_files(temp)?;
+
+    let public_key_path = public_key_path(temp, "test-reader-auth-crt");
+    generate_public_key(&public_key_path);
+
+    Ok((public_key_path, ca_crt, ca_key, rp_auth_prefix, rp_auth_json))
+}
+
+#[test]
+fn missing_input_files_reader() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    // Setup files without CA key
+    let (ca_crt, ca_key, rp_auth_prefix, rp_auth_json) = setup_reader_files(&temp)?;
+    std::fs::remove_file(&ca_key)?;
+
+    // Generate reader should fail on missing CA key
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_key_file(&ca_key));
+
+    // Setup files without CA crt
+    let (ca_crt, ca_key, rp_auth_prefix, rp_auth_json) = setup_reader_files(&temp)?;
+    std::fs::remove_file(&ca_crt)?;
+
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_crt_file(&ca_crt));
+
+    // Setup files without reader registration JSON file
+    let (ca_crt, ca_key, rp_auth_prefix, rp_auth_json) = setup_reader_files(&temp)?;
+    std::fs::remove_file(&rp_auth_json)?;
+
+    // Generate reader_auth should fail when missing JSON file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_kp(&ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_reader_json_file(&rp_auth_json));
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn missing_input_files_reader_pubkey() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    // Setup files without CA key
+    let (public_key_file, ca_crt, ca_key, rp_auth_prefix, rp_auth_json) = setup_reader_pubkey_files(&temp)?;
+    std::fs::remove_file(&ca_key)?;
+
+    // Generate reader should fail on missing CA key
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_cert(&public_key_file, &ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_key_file(&ca_key));
+
+    // Setup files without CA crt
+    let (public_key_file, ca_crt, ca_key, rp_auth_prefix, rp_auth_json) = setup_reader_pubkey_files(&temp)?;
+    std::fs::remove_file(&ca_crt)?;
+
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_cert(&public_key_file, &ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_crt_file(&ca_crt));
+
+    // Setup files without reader registration JSON file
+    let (public_key_file, ca_crt, ca_key, rp_auth_prefix, rp_auth_json) = setup_reader_pubkey_files(&temp)?;
+    std::fs::remove_file(&rp_auth_json)?;
+
+    // Generate reader_auth should fail when missing JSON file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_cert(&public_key_file, &ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_reader_json_file(&rp_auth_json));
+
+    // Setup files without public key file
+    let (public_key_file, ca_crt, ca_key, rp_auth_prefix, rp_auth_json) = setup_reader_pubkey_files(&temp)?;
+    std::fs::remove_file(&public_key_file)?;
+
+    // Generate reader_auth should fail when missing JSON file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_reader_cert(&public_key_file, &ca_crt, &ca_key, &rp_auth_json, &rp_auth_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_public_key_file(&public_key_file));
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+fn setup_tsl_files(temp: &TempDir) -> (ChildPath, ChildPath, ChildPath) {
+    let (ca_prefix, ca_crt, ca_key) = keypair_paths(temp, "test-ca");
+    let (tsl_prefix, _tsl_crt, _tsl_key) = keypair_paths(temp, "test-tls-kp");
+
+    // Generate ca
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_ca(&ca_prefix)
+        .arg("--force")
+        .assert()
+        .success();
+
+    (ca_crt, ca_key, tsl_prefix)
+}
+
+fn setup_tsl_pubkey_files(temp: &TempDir) -> (ChildPath, ChildPath, ChildPath, ChildPath) {
+    let (ca_crt, ca_key, tsl_prefix) = setup_tsl_files(temp);
+
+    let public_key_path = public_key_path(temp, "test-tslh-crt");
+    generate_public_key(&public_key_path);
+
+    (public_key_path, ca_crt, ca_key, tsl_prefix)
+}
+
+#[test]
+fn missing_input_files_tsl() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    // Setup files without CA key
+    let (ca_crt, ca_key, tsl_prefix) = setup_tsl_files(&temp);
+    std::fs::remove_file(&ca_key)?;
+
+    // Generate reader should fail on missing CA key
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_kp(&ca_crt, &ca_key, &tsl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_key_file(&ca_key));
+
+    // Setup files without CA crt
+    let (ca_crt, ca_key, tsl_prefix) = setup_tsl_files(&temp);
+    std::fs::remove_file(&ca_crt)?;
+
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_kp(&ca_crt, &ca_key, &tsl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_crt_file(&ca_crt));
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}
+
+#[test]
+fn missing_input_files_tsl_pubkey() -> Result<()> {
+    let temp = TempDir::new()?;
+
+    // Setup files without CA key
+    let (public_key_file, ca_crt, ca_key, tsl_prefix) = setup_tsl_pubkey_files(&temp);
+    std::fs::remove_file(&ca_key)?;
+
+    // Generate reader should fail on missing CA key
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_cert(&public_key_file, &ca_crt, &ca_key, &tsl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_key_file(&ca_key));
+
+    // Setup files without CA crt
+    let (public_key_file, ca_crt, ca_key, tsl_prefix) = setup_tsl_pubkey_files(&temp);
+    std::fs::remove_file(&ca_crt)?;
+
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_cert(&public_key_file, &ca_crt, &ca_key, &tsl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_crt_file(&ca_crt));
+
+    // Setup files without public key file
+    let (public_key_file, ca_crt, ca_key, tsl_prefix) = setup_tsl_pubkey_files(&temp);
+    std::fs::remove_file(&public_key_file)?;
+
+    // Generate reader_auth should fail when missing JSON file
+    Command::new(assert_cmd::cargo::cargo_bin!())
+        .generate_tsl_cert(&public_key_file, &ca_crt, &ca_key, &tsl_prefix)
+        .assert()
+        .failure()
+        .stderr(predicate_missing_public_key_file(&public_key_file));
+
+    // Explicitly close the temp folder, for better error reporting
+    temp.close()?;
+
+    Ok(())
+}

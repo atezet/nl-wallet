@@ -1,0 +1,441 @@
+use std::borrow::Cow;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::time::Duration;
+
+use error_category::ErrorCategory;
+use error_category::sentry_capture_error;
+use futures::try_join;
+use http_utils::client::TlsPinningConfig;
+use http_utils::reqwest::HttpJsonClient;
+use http_utils::reqwest::default_reqwest_client_builder;
+use openid4vc::disclosure_session::DisclosureClient;
+use openid4vc::disclosure_session::VpDisclosureClient;
+use openid4vc::wallet_issuance::IssuanceDiscovery;
+use openid4vc::wallet_issuance::discovery::HttpIssuanceDiscovery;
+use platform_support::attested_key::AttestedKeyHolder;
+use platform_support::hw_keystore::hardware::HardwareEncryptionKey;
+use platform_support::utils::PlatformUtilities;
+use platform_support::utils::UtilitiesError;
+use platform_support::utils::hardware::HardwareUtilities;
+use reqwest::ClientBuilder;
+use token_status_list::verification::client::StatusListClient;
+use token_status_list::verification::reqwest::HttpStatusListClient;
+use tokio::sync::RwLock;
+use update_policy_model::update_policy::VersionState;
+use wallet_configuration::wallet_config::WalletConfiguration;
+
+use super::KeyHolderType;
+use super::Wallet;
+use super::WalletRegistration;
+use crate::config::ConfigurationError;
+use crate::config::UpdatingConfigurationRepository;
+use crate::config::WalletConfigurationRepository;
+use crate::config::default_config_server_config;
+use crate::config::default_wallet_config;
+use crate::config::init_universal_link_base_url;
+use crate::lock::WalletLock;
+use crate::repository::BackgroundUpdateableRepository;
+use crate::repository::Repository;
+use crate::storage::DatabaseStorage;
+use crate::storage::KeyData;
+use crate::storage::RegistrationData;
+use crate::storage::Storage;
+use crate::storage::StorageError;
+use crate::storage::StorageState;
+use crate::update_policy::UpdatePolicyRepository;
+
+const DATABASE_NAME: &str = "wallet";
+
+const REVOCATION_CHECK_FREQUENCY: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, thiserror::Error, ErrorCategory)]
+#[category(defer)]
+pub enum WalletInitError {
+    #[error("wallet configuration error")]
+    Configuration(#[from] ConfigurationError),
+
+    #[error("platform utilities error: {0}")]
+    Utilities(#[from] UtilitiesError),
+
+    #[error("could not initialize database: {0}")]
+    Database(#[from] StorageError),
+
+    #[error("could not initialize HTTP client: {0}")]
+    #[category(critical)]
+    HttpClient(#[from] reqwest::Error),
+}
+
+#[cfg(feature = "fake_attestation")]
+static KEY_HOLDER_ONCE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+pub(super) enum RegistrationStatus {
+    Unregistered,
+    KeyIdentifierGenerated(String),
+    Registered(RegistrationData),
+}
+
+#[cfg(feature = "fake_attestation")]
+async fn init_mock_key_holder() -> platform_support::attested_key::mock::PersistentMockAttestedKeyHolder {
+    use apple_app_attest::AttestationEnvironment;
+    use platform_support::attested_key::mock::PersistentMockAttestedKeyHolder;
+
+    // Initialize the key holder, but make sure this happens only once.
+    KEY_HOLDER_ONCE
+        .get_or_init(|| async {
+            PersistentMockAttestedKeyHolder::init::<HardwareUtilities>().await;
+        })
+        .await;
+
+    // Read the Apple attestation environment from an environment variable, defaulting to the development environment.
+    let apple_attestation_environment = option_env!("APPLE_ATTESTATION_ENVIRONMENT")
+        .map(|environment| match environment {
+            "development" => AttestationEnvironment::Development,
+            "production" => AttestationEnvironment::Production,
+            _ => panic!("Invalid Apple attestation environment"),
+        })
+        .unwrap_or(AttestationEnvironment::Development);
+
+    PersistentMockAttestedKeyHolder::new_mock_xcode(apple_attestation_environment)
+}
+
+impl<APC>
+    Wallet<
+        WalletConfigurationRepository,
+        UpdatePolicyRepository,
+        DatabaseStorage<HardwareEncryptionKey>,
+        KeyHolderType,
+        APC,
+        HttpIssuanceDiscovery,
+        VpDisclosureClient,
+    >
+where
+    APC: Default,
+{
+    #[sentry_capture_error]
+    pub async fn init_all() -> Result<Self, WalletInitError> {
+        init_universal_link_base_url();
+
+        // When using fake attestations, initialize the key holder, but make sure this happens only once.
+        let key_holder = cfg_select! {
+            feature = "fake_attestation" => init_mock_key_holder().await,
+            _ => platform_support::attested_key::hardware::HardwareAttestedKeyHolder::default(),
+        };
+
+        let update_policy_repository = UpdatePolicyRepository::init();
+
+        let storage_path = HardwareUtilities::storage_path().await?;
+        let storage = DatabaseStorage::<HardwareEncryptionKey>::new(Cow::Borrowed(DATABASE_NAME), storage_path.clone());
+        let config_repository = UpdatingConfigurationRepository::init(
+            storage_path.clone(),
+            default_config_server_config(),
+            default_wallet_config(),
+        )
+        .await?;
+
+        let repositories = WalletRepositories {
+            config_repository,
+            update_policy_repository,
+        };
+
+        let wallet_clients = WalletClients::new()?;
+
+        Self::init_registration(storage, key_holder, repositories, wallet_clients).await
+    }
+}
+
+#[derive(Debug)]
+pub struct WalletRepositories<CR, UR> {
+    pub config_repository: CR,
+    pub update_policy_repository: UR,
+}
+
+#[derive(Debug, Default)]
+pub struct WalletClients<APC, CID, DCC, SLC> {
+    pub account_provider_client: APC,
+    pub credential_issuer_discovery: CID,
+    pub disclosure_client: DCC,
+    pub status_list_client: SLC,
+}
+
+fn reqwest_client_builder() -> ClientBuilder {
+    cfg_select! {
+        feature = "allow_insecure_url" => {
+            default_reqwest_client_builder()
+        }
+        _ => {
+            http_utils::reqwest::default_tls_reqwest_client_builder()
+        }
+    }
+}
+
+impl<APC> WalletClients<APC, HttpIssuanceDiscovery, VpDisclosureClient, HttpStatusListClient>
+where
+    APC: Default,
+{
+    pub fn new() -> Result<Self, reqwest::Error> {
+        let credential_issuer_discovery =
+            HttpIssuanceDiscovery::new(HttpJsonClient::try_new(reqwest_client_builder())?);
+        let disclosure_client = VpDisclosureClient::new_with_client(reqwest_client_builder())?;
+        // Note that HTTP is explicitly allowed for the retrieval of status lists.
+        let status_list_client = HttpStatusListClient::new(default_reqwest_client_builder())?;
+
+        let clients = Self {
+            account_provider_client: APC::default(),
+            credential_issuer_discovery,
+            disclosure_client,
+            status_list_client,
+        };
+
+        Ok(clients)
+    }
+}
+
+impl<CR, UR, S, AKH, APC, CID, DCC, CPC, SLC> Wallet<CR, UR, S, AKH, APC, CID, DCC, CPC, SLC>
+where
+    AKH: AttestedKeyHolder,
+    CID: IssuanceDiscovery,
+    DCC: DisclosureClient,
+    SLC: StatusListClient,
+{
+    pub(super) fn new(
+        storage: S,
+        key_holder: AKH,
+        repositories: WalletRepositories<CR, UR>,
+        wallet_clients: WalletClients<APC, CID, DCC, SLC>,
+        registration_status: RegistrationStatus,
+    ) -> Self {
+        let registration = match registration_status {
+            RegistrationStatus::Unregistered => WalletRegistration::Unregistered,
+            RegistrationStatus::KeyIdentifierGenerated(key_identifier) => {
+                WalletRegistration::KeyIdentifierGenerated(key_identifier)
+            }
+            RegistrationStatus::Registered(data) => {
+                // If the database contains a registration, an attested key
+                // already exists and we can reference it by its identifier.
+                // If a reference to this key already exists within the process
+                // this is programmer error and should result in a panic.
+                let attested_key = key_holder
+                    .attested_key(data.attested_key_identifier.clone())
+                    .expect("should be able to instantiate hardware attested key");
+
+                WalletRegistration::Registered {
+                    attested_key: Arc::new(attested_key),
+                    data,
+                }
+            }
+        };
+
+        Wallet {
+            config_repository: Arc::new(repositories.config_repository),
+            update_policy_repository: repositories.update_policy_repository,
+            storage: Arc::new(RwLock::new(storage)),
+            key_holder,
+            registration,
+            account_provider_client: Arc::new(wallet_clients.account_provider_client),
+            issuance_discovery: wallet_clients.credential_issuer_discovery,
+            disclosure_client: wallet_clients.disclosure_client,
+            close_proximity_disclosure: PhantomData,
+            status_list_client: Arc::new(wallet_clients.status_list_client),
+            session: None,
+            lock: WalletLock::new(true),
+            attestations_callback: Arc::default(),
+            recent_history_callback: None,
+            scheduled_notifications_callback: Arc::default(),
+            direct_notifications_callback: Arc::default(),
+            revocation_status_job_handle: None,
+        }
+    }
+
+    /// Initialize the wallet by loading initial state.
+    pub async fn init_registration(
+        mut storage: S,
+        key_holder: AKH,
+        repositories: WalletRepositories<CR, UR>,
+        wallet_clients: WalletClients<APC, CID, DCC, SLC>,
+    ) -> Result<Self, WalletInitError>
+    where
+        CR: Repository<Arc<WalletConfiguration>> + Send + Sync + 'static,
+        UR: BackgroundUpdateableRepository<VersionState, TlsPinningConfig>,
+        SLC: Sync + 'static,
+        S: Storage + Sync + 'static,
+    {
+        let http_config = repositories
+            .config_repository
+            .get()
+            .update_policy_server
+            .http_config
+            .clone();
+        repositories.update_policy_repository.fetch_in_background(http_config);
+
+        let registration_status = Self::fetch_registration_status(&mut storage).await?;
+
+        let mut wallet = Self::new(storage, key_holder, repositories, wallet_clients, registration_status);
+
+        wallet.start_background_revocation_checks(REVOCATION_CHECK_FREQUENCY);
+
+        Ok(wallet)
+    }
+}
+
+impl<CR, UR, S, AKH, APC, CID, DCC, CPC, SLC> Wallet<CR, UR, S, AKH, APC, CID, DCC, CPC, SLC>
+where
+    S: Storage,
+    AKH: AttestedKeyHolder,
+    CID: IssuanceDiscovery,
+    DCC: DisclosureClient,
+    SLC: StatusListClient,
+{
+    /// Attempts to fetch the initial data from storage, without creating a database if there is none.
+    async fn fetch_registration_status(storage: &mut S) -> Result<RegistrationStatus, StorageError> {
+        match storage.state().await? {
+            // If there is no database file, we can conclude early that there is no registration.
+            StorageState::Uninitialized => return Ok(RegistrationStatus::Unregistered),
+            // Open the database, if necessary.
+            StorageState::Unopened => storage.open().await?,
+            StorageState::Opened => (),
+        }
+
+        let (key_data, registration_data) = try_join!(
+            storage.fetch_data::<KeyData>(),
+            storage.fetch_data::<RegistrationData>()
+        )?;
+
+        let registration_status = match (key_data, registration_data) {
+            (None, None) => RegistrationStatus::Unregistered,
+            (Some(key_data), None) => RegistrationStatus::KeyIdentifierGenerated(key_data.identifier),
+            (_, Some(registration_data)) => RegistrationStatus::Registered(registration_data),
+        };
+
+        Ok(registration_status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use p256::ecdsa::SigningKey;
+    use rand_core::OsRng;
+    use wallet_account::RevocationCode;
+
+    use super::super::test;
+    use super::super::test::WalletDeviceVendor;
+    use super::*;
+    use crate::pin::key as pin_key;
+    use crate::storage::MockStorage;
+    use crate::wallet::test::TestWalletMockStorage;
+    use crate::wallet::test::generate_key_holder;
+
+    // Tests if the `Wallet::init_registration()` method completes successfully with the mock generics.
+    #[tokio::test]
+    async fn test_wallet_init_registration() {
+        let wallet = TestWalletMockStorage::new_init_registration(WalletDeviceVendor::Apple)
+            .await
+            .expect("Could not initialize wallet");
+
+        assert!(!wallet.has_registration());
+    }
+
+    // Tests the initialization logic on a wallet without a database file.
+    #[tokio::test]
+    async fn test_wallet_init_fetch_registration_unopened_database() {
+        let mut storage = MockStorage::default();
+        storage.expect_state().returning(|| Ok(StorageState::Uninitialized));
+
+        let wallet = TestWalletMockStorage::new_init_registration_with_mock_storage(
+            generate_key_holder(WalletDeviceVendor::Apple),
+            storage,
+        )
+        .await
+        .expect("Could not initialize wallet");
+
+        // The wallet should have no registration, and no database should be opened.
+        assert!(!wallet.registration.is_registered());
+        assert!(!wallet.has_registration());
+        assert!(matches!(
+            wallet.storage.read().await.state().await.unwrap(),
+            StorageState::Uninitialized
+        ));
+
+        // The wallet should be locked by default
+        assert!(wallet.is_locked());
+    }
+
+    // Tests the initialization logic on a wallet with a database file, but no registration.
+    #[tokio::test]
+    async fn test_wallet_init_fetch_registration_no_registration() {
+        let mut storage = MockStorage::default();
+        storage.expect_state().times(1).returning(|| Ok(StorageState::Unopened));
+        storage.expect_open().returning(|| Ok(()));
+        storage.expect_fetch_data::<RegistrationData>().returning(|| Ok(None));
+        storage.expect_fetch_data::<KeyData>().returning(|| Ok(None));
+        storage.expect_state().times(1).returning(|| Ok(StorageState::Opened));
+
+        let wallet = TestWalletMockStorage::new_init_registration_with_mock_storage(
+            generate_key_holder(WalletDeviceVendor::Apple),
+            storage,
+        )
+        .await
+        .expect("Could not initialize wallet");
+        // The wallet should have no registration, the database should be opened.
+        assert!(!wallet.registration.is_registered());
+        assert!(!wallet.has_registration());
+        assert!(matches!(
+            wallet.storage.read().await.state().await.unwrap(),
+            StorageState::Opened
+        ));
+    }
+
+    // Tests the initialization logic on a wallet with a database file that contains a registration.
+    #[tokio::test]
+    async fn test_wallet_init_fetch_with_registration() {
+        let key_holder = test::generate_key_holder(WalletDeviceVendor::Apple);
+        key_holder.populate_key_identifier("key_id_123".to_string(), SigningKey::random(&mut OsRng));
+
+        let pin_salt = pin_key::new_pin_salt();
+        let expected_pin_salt = pin_salt.clone();
+
+        let mut storage = MockStorage::default();
+        storage.expect_state().times(1).returning(|| Ok(StorageState::Unopened));
+        storage.expect_open().returning(|| Ok(()));
+        storage.expect_fetch_data::<RegistrationData>().returning(move || {
+            Ok(Some(RegistrationData {
+                attested_key_identifier: "key_id_123".to_string(),
+                pin_salt: expected_pin_salt.clone(),
+                wallet_id: "wallet_123".to_string(),
+                wallet_certificate: "this.isa.jwt".parse().unwrap(),
+                revocation_code: RevocationCode::new_random(),
+            }))
+        });
+        storage.expect_fetch_data::<KeyData>().returning(|| Ok(None));
+        storage.expect_state().times(1).returning(|| Ok(StorageState::Opened));
+
+        let wallet = TestWalletMockStorage::new_init_registration_with_mock_storage(key_holder, storage)
+            .await
+            .expect("Could not initialize wallet");
+
+        // The wallet should have a registration, the database should be opened.
+        assert!(wallet.registration.is_registered());
+        assert!(wallet.has_registration());
+        assert!(matches!(
+            wallet.storage.read().await.state().await.unwrap(),
+            StorageState::Opened
+        ));
+
+        // The registration data should now be available.
+        let (_, registration_data) = wallet.registration.as_key_and_registration_data().unwrap();
+        assert_eq!(registration_data.pin_salt, pin_salt);
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn test_wallet_init_fetch_with_registration_panic() {
+        let mut storage = MockStorage::default();
+        storage.expect_state().returning(|| Ok(StorageState::Unopened));
+
+        let _ = TestWalletMockStorage::new_init_registration_with_mock_storage(
+            generate_key_holder(WalletDeviceVendor::Apple),
+            storage,
+        )
+        .await;
+    }
+}

@@ -1,0 +1,68 @@
+[package]
+name = "sd_jwt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "api_test"
+path = "tests/api_test.rs"
+required-features = ["examples"]
+
+[features]
+examples = [
+    "dep:futures",
+    "dep:rand_core",
+    "attestation_types/mock",
+    "attestation_types/test_pid_constants",
+    "token_status_list/mock",
+    "utils/mock_time",
+]
+mock = []
+test = ["dep:futures"]
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+derive_more = { workspace = true, features = ["as_ref", "display", "from_str"] }
+indexmap.workspace = true
+itertools.workspace = true
+jsonwebtoken.workspace = true
+nutype = { workspace = true, features = ["serde"] }
+p256.workspace = true
+rand.workspace = true
+rustls-pki-types.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_with = { workspace = true, features = ["base64", "chrono"] }
+ssri.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+
+futures = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+
+attestation_types.path = "../attestation_types"
+crypto.path = "../crypto"
+http_utils.path = "../http_utils"
+jwt.path = "../jwt"
+sd_jwt_vc_metadata.path = "../sd_jwt_vc_metadata"
+token_status_list = { path = "../token_status_list", features = ["verification"] }
+utils.path = "../utils"
+
+[dev-dependencies]
+attestation_types = { path = "../attestation_types", features = ["mock", "test_pid_constants"] }
+chrono = { workspace = true, features = ["now"] }
+derive_more = { workspace = true, features = ["as_ref", "display", "from_str", "unwrap"] }
+futures.workspace = true
+rand_core.workspace = true
+rstest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "macros"] }
+tokio-test.workspace = true
+
+crypto = { path = "../crypto", features = ["generate", "mock"] }
+token_status_list = { path = "../token_status_list", features = ["mock"] }
+utils = { path = "../utils", features = ["mock_time"] }

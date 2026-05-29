@@ -1,0 +1,82 @@
+use std::assert_matches;
+use std::env;
+
+use http_utils::client::TlsPinningConfig;
+use serde_json::json;
+use tests_integration::common::*;
+use tests_integration::utils::read_file;
+use update_policy_server::config::UpdatePolicyConfig;
+use utils::vec_nonempty;
+use wallet::test::HttpUpdatePolicyRepository;
+use wallet::test::Repository;
+use wallet::test::RepositoryUpdateState;
+use wallet::test::UpdateableRepository;
+use wallet_configuration::wallet_config::UpdatePolicyServerConfiguration;
+
+#[tokio::test]
+async fn ltc42_test_wallet_update_policy() {
+    let (mut ups_settings, root_ca) = update_policy_server_settings();
+    ups_settings.update_policy =
+        serde_json::from_value::<UpdatePolicyConfig>(json!({ env!("CARGO_PKG_VERSION"): "Block" })).unwrap();
+
+    let port = start_update_policy_server(ups_settings.clone(), root_ca).await;
+
+    let root_ca = read_file("ups.ca.crt.der").try_into().unwrap();
+    let update_policy_server_config = UpdatePolicyServerConfiguration {
+        http_config: TlsPinningConfig::try_new(local_ups_base_url(port), vec_nonempty![root_ca]).unwrap(),
+    };
+
+    let update_policy = HttpUpdatePolicyRepository::new();
+
+    let before = update_policy.get();
+    let result = update_policy
+        .fetch(&update_policy_server_config.http_config)
+        .await
+        .unwrap();
+    let after = update_policy.get();
+
+    assert_matches!(result, RepositoryUpdateState::Updated { .. });
+    assert_ne!(before, after);
+}
+
+#[tokio::test]
+async fn test_wallet_update_policy_stale() {
+    let (ups_settings, root_ca) = update_policy_server_settings();
+    let port = start_update_policy_server(ups_settings.clone(), root_ca).await;
+
+    let root_ca = read_file("ups.ca.crt.der").try_into().unwrap();
+    let update_policy_server_config = UpdatePolicyServerConfiguration {
+        http_config: TlsPinningConfig::try_new(local_ups_base_url(port), vec_nonempty![root_ca]).unwrap(),
+    };
+
+    let update_policy = HttpUpdatePolicyRepository::new();
+    let before = update_policy.get();
+    let result = update_policy
+        .fetch(&update_policy_server_config.http_config)
+        .await
+        .unwrap();
+    let after = update_policy.get();
+
+    assert_matches!(result, RepositoryUpdateState::Unmodified(_));
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn test_wallet_update_policy_server_tls_pinning() {
+    let (ups_settings, root_ca) = update_policy_server_settings();
+    let port = start_update_policy_server(ups_settings.clone(), root_ca).await;
+
+    // Use bad root CA
+    let root_ca = read_file("bad.ca.crt.der").try_into().unwrap();
+    let update_policy_server_config = UpdatePolicyServerConfiguration {
+        http_config: TlsPinningConfig::try_new(local_ups_base_url(port), vec_nonempty![root_ca]).unwrap(),
+    };
+
+    let update_policy = HttpUpdatePolicyRepository::new();
+    let before = update_policy.get();
+    let result = update_policy.fetch(&update_policy_server_config.http_config).await;
+    let after = update_policy.get();
+
+    assert_matches!(result, Err(_));
+    assert_eq!(before, after);
+}

@@ -1,0 +1,193 @@
+{
+  "vct": "https://sd_jwt_vc_metadata.example.com/example_credential_v2",
+  "name": "NL Wallet PID credential v2",
+  "description": "Working version of the NL Wallet PID credential v2",
+  "extends": "https://sd_jwt_vc_metadata.example.com/example_credential",
+  "extends#integrity": "sha256-DsflKWcW0ZjAW6OiNNW9iRduLJH1d+elad1PnSW+ecE=",
+  "display": [
+    {
+      "lang": "nl-NL",
+      "name": "NL Wallet persoonsgegevens",
+      "description": "De persoonsgegevensattestatie voor de NL Wallet",
+      "summary": "Uitgebreid voorbeeld persoonsgegevensattestatie van {{nickname}}"
+    },
+    {
+      "lang": "en-US",
+      "name": "NL Wallet personal data",
+      "description": "The personal data credential for the NL Wallet",
+      "summary": "Extended example PID credential of {{nickname}}"
+    }
+  ],
+  "claims": [
+    {
+      "path": ["nickname"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Cool nickname"
+        }
+      ],
+      "sd": "always",
+      "svg_id": "nickname"
+    },
+    {
+      "path": ["birth_date"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Birth date",
+          "description": "Date of birth"
+        }
+      ],
+      "sd": "always"
+    },
+    {
+      "path": ["place_of_birth", "locality"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Locality"
+        }
+      ],
+      "sd": "always"
+    },
+    {
+      "path": ["place_of_birth", "country", "name"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Country"
+        }
+      ],
+      "sd": "allowed"
+    },
+    {
+      "path": ["place_of_birth", "country", "area_code"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Country area code"
+        }
+      ],
+      "sd": "never"
+    },
+    {
+      "path": ["place_of_birth", "country", "is_eu_member"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Country is a member of the EU"
+        }
+      ],
+      "sd": "never"
+    },
+    {
+      "path": ["financial", "has_debt"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Has debt"
+        }
+      ],
+      "sd": "always"
+    },
+    {
+      "path": ["financial", "debt_amount"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Amount of debt (in euros)"
+        }
+      ],
+      "sd": "always"
+    },
+    {
+      "path": ["financial", "has_job"],
+      "display": [
+        {
+          "lang": "en-US",
+          "label": "Is gainfully employed"
+        }
+      ],
+      "sd": "always"
+    }
+  ],
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "NL Wallet extended PID VCT Schema",
+    "description": "The JSON schema that defines the NL Wallet extended PID VCT",
+    "type": "object",
+    "properties": {
+      "vct": {
+        "type": "string"
+      },
+      "vct#integrity": {
+        "type": "string"
+      },
+      "iss": {
+        "type": "string"
+      },
+      "iat": {
+        "type": "number"
+      },
+      "nbf": {
+        "type": "number"
+      },
+      "exp": {
+        "type": "number"
+      },
+      "cnf": {
+        "type": "object"
+      },
+      "status": {
+        "type": "object"
+      },
+      "attestation_qualification": {
+        "type": "string"
+      },
+      "birth_date": {
+        "type": "string"
+      },
+      "place_of_birth": {
+        "type": "object",
+        "properties": {
+          "locality": {
+            "type": "string"
+          },
+          "country": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "area_code": {
+                "type": "integer"
+              },
+              "is_eu_member": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "financial": {
+        "type": "object",
+        "properties": {
+          "has_debt": {
+            "type": "boolean"
+          },
+          "has_job": {
+            "type": "boolean"
+          },
+          "debt_amount": {
+            "type": "integer"
+          }
+        }
+      },
+      "nickname": {
+        "type": "string"
+      }
+    },
+    "required": ["vct", "iss", "iat", "status", "attestation_qualification"]
+  }
+}

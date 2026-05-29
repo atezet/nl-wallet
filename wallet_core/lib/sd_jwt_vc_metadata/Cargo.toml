@@ -1,0 +1,36 @@
+[package]
+name = "sd_jwt_vc_metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[features]
+example_constructors = []
+
+[dependencies]
+derive_more = { workspace = true, features = ["as_ref", "debug"] }
+itertools.workspace = true
+jsonschema.workspace = true
+nutype = { workspace = true, features = ["regex"] }
+regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_with = { workspace = true, features = ["base64"] }
+ssri.workspace = true
+thiserror.workspace = true
+
+attestation_types.path = "../attestation_types"
+crypto.path = "../crypto"
+http_utils.path = "../http_utils"
+utils.path = "../utils"
+
+[dev-dependencies]
+rstest.workspace = true
+
+attestation_types = { path = "../../lib/attestation_types", features = ["test_pid_constants"] }

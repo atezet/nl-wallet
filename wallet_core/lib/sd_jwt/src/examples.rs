@@ -1,0 +1,202 @@
+use std::time::Duration;
+
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use chrono::DateTime;
+use chrono::Utc;
+use http_utils::urls::HttpsUri;
+use indexmap::IndexMap;
+use jsonwebtoken::jwk::Jwk;
+use jwt::EcdsaDecodingKey;
+use jwt::Header;
+use jwt::JwtTyp;
+use jwt::confirmation::ConfirmationClaim;
+use jwt::jwk::jwk_to_p256;
+use jwt::nonce::Nonce;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::json;
+use serde_with::skip_serializing_none;
+use utils::date_time_seconds::DateTimeSeconds;
+use utils::generator::Generator;
+use utils::generator::mock::MockTimeGenerator;
+
+use crate::claims::ClaimValue;
+use crate::disclosure::Disclosure;
+use crate::disclosure::DisclosureContent;
+use crate::hasher::Hasher;
+use crate::hasher::Sha256Hasher;
+use crate::sd_alg::SdAlg;
+use crate::sd_jwt::SdJwtClaims;
+use crate::sd_jwt::SdJwtVcClaims;
+use crate::sd_jwt::UnverifiedSdJwt;
+use crate::sd_jwt::UnverifiedSdJwtPresentation;
+use crate::sd_jwt::VerifiedSdJwt;
+use crate::sd_jwt::VerifiedSdJwtPresentation;
+
+// Taken from https://www.ietf.org/archive/id/draft-ietf-oauth-selective-disclosure-jwt-17.html#name-simple-structured-sd-jwt
+pub const SIMPLE_STRUCTURED_SD_JWT: &str = include_str!("../examples/spec/simple_structured.jwt");
+
+// Taken from https://www.ietf.org/archive/id/draft-ietf-oauth-selective-disclosure-jwt-17.html#name-complex-structured-sd-jwt
+pub const COMPLEX_STRUCTURED_SD_JWT: &str = include_str!("../examples/spec/complex_structured.jwt");
+
+// Taken from https://www.ietf.org/archive/id/draft-ietf-oauth-selective-disclosure-jwt-17.html#name-sd-jwt-based-verifiable-cre
+pub const SD_JWT_VC: &str = include_str!("../examples/spec/sd_jwt_vc.jwt");
+
+// Taken from https://www.ietf.org/archive/id/draft-ietf-oauth-selective-disclosure-jwt-17.html#name-sd-jwt-based-verifiable-cre
+pub const SD_JWT_VC_WITH_KB: &str = include_str!("../examples/spec/sd_jwt_vc_with_kb.jwt");
+
+// Taken from https://www.ietf.org/archive/id/draft-ietf-oauth-selective-disclosure-jwt-17.html#name-presentation
+pub const WITH_KB_SD_JWT: &str = include_str!("../examples/spec/with_kb.jwt");
+
+pub const WITH_KB_SD_JWT_AUD: &str = "https://verifier.example.org";
+pub const WITH_KB_SD_JWT_NONCE: &str = "1234567890";
+
+// Constructed from [SIMPLE_STRUCTURED_SD_JWT] with invalid disclosure: ["lklxF5jMYlGTPUovMNIvCA", "country", [{"...":
+// 0}]]
+pub const INVALID_DISCLOSURE_SD_JWT: &str = include_str!("../examples/invalid_disclosure.jwt");
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SdJwtExampleClaims {
+    pub _sd_alg: Option<SdAlg>,
+
+    pub iss: Option<HttpsUri>,
+
+    pub cnf: Option<ConfirmationClaim>,
+
+    pub iat: Option<DateTimeSeconds>,
+
+    pub exp: Option<DateTimeSeconds>,
+
+    pub nbf: Option<DateTimeSeconds>,
+
+    #[serde(flatten)]
+    pub claims: ClaimValue,
+}
+
+impl JwtTyp for SdJwtExampleClaims {
+    const TYP: &'static str = "example+sd-jwt";
+}
+
+impl SdJwtClaims for SdJwtExampleClaims {
+    fn _sd_alg(&self) -> Option<SdAlg> {
+        self._sd_alg
+    }
+
+    fn claims(&self) -> &ClaimValue {
+        &self.claims
+    }
+
+    fn cnf(&self) -> &ConfirmationClaim {
+        self.cnf.as_ref().unwrap()
+    }
+}
+
+impl VerifiedSdJwt {
+    pub fn spec_simple_structured() -> VerifiedSdJwt<SdJwtExampleClaims, Header> {
+        SIMPLE_STRUCTURED_SD_JWT
+            .parse::<UnverifiedSdJwt<SdJwtExampleClaims, Header>>()
+            .unwrap()
+            .into_verified(&examples_sd_jwt_decoding_key())
+            .unwrap()
+    }
+
+    pub fn spec_complex_structured() -> VerifiedSdJwt<SdJwtExampleClaims, Header> {
+        COMPLEX_STRUCTURED_SD_JWT
+            .parse::<UnverifiedSdJwt<SdJwtExampleClaims, Header>>()
+            .unwrap()
+            .into_verified(&examples_sd_jwt_decoding_key())
+            .unwrap()
+    }
+
+    pub fn spec_sd_jwt_vc() -> VerifiedSdJwt<SdJwtVcClaims, Header> {
+        SD_JWT_VC
+            .parse::<UnverifiedSdJwt<SdJwtVcClaims, Header>>()
+            .unwrap()
+            .into_verified(&examples_sd_jwt_decoding_key())
+            .unwrap()
+    }
+}
+
+impl VerifiedSdJwtPresentation {
+    pub fn spec_sd_jwt_kb() -> VerifiedSdJwtPresentation<SdJwtExampleClaims, Header> {
+        WITH_KB_SD_JWT
+            .parse::<UnverifiedSdJwtPresentation<SdJwtExampleClaims, Header>>()
+            .unwrap()
+            .into_verified(
+                &examples_sd_jwt_decoding_key(),
+                WITH_KB_SD_JWT_AUD,
+                &Nonce::from(WITH_KB_SD_JWT_NONCE.to_string()),
+                Duration::from_secs(2 * 60),
+                &MockTimeGenerator::default(),
+            )
+            .unwrap()
+    }
+}
+
+pub struct KeyBindingExampleTimeGenerator;
+
+impl Generator<DateTime<Utc>> for KeyBindingExampleTimeGenerator {
+    fn generate(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp(1740818271, 0).unwrap()
+    }
+}
+
+// Taken from https://www.ietf.org/archive/id/draft-ietf-oauth-selective-disclosure-jwt-17.html#name-example-sd-jwt-with-recursi
+pub fn recursive_disclosures_example() -> (serde_json::Value, IndexMap<String, Disclosure>) {
+    let claims = json!({
+      "_sd": [
+        "HvrKX6fPV0v9K_yCVFBiLFHsMaxcD_114Em6VT8x1lg"
+      ],
+      "vct": "com.example.pid",
+      "iss": "https://issuer.example.com",
+      "iat": 1683000000,
+      "exp": 1883000000,
+      "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
+      "_sd_alg": "sha-256",
+      "cnf": {
+          "jwk": {
+              "kty": "EC",
+              "crv": "P-256",
+              "x": "TCAER19Zvu3OHF4j4W4vfSVoHIP1ILilDls7vCeGemc",
+              "y": "ZxjiWWbZMQGHVWKVQ4hbSIirsVfuecCE6t4jT9F2HZQ"
+          }
+      }
+    });
+
+    let disclosures = vec![
+        "WyIyR0xDNDJzS1F2ZUNmR2ZyeU5STjl3IiwgInN0cmVldF9hZGRyZXNzIiwgIlNjaHVsc3RyLiAxMiJd",
+        "WyJlbHVWNU9nM2dTTklJOEVZbnN4QV9BIiwgImxvY2FsaXR5IiwgIlNjaHVscGZvcnRhIl0",
+        "WyI2SWo3dE0tYTVpVlBHYm9TNXRtdlZBIiwgInJlZ2lvbiIsICJTYWNoc2VuLUFuaGFsdCJd",
+        "WyJlSThaV205UW5LUHBOUGVOZW5IZGhRIiwgImNvdW50cnkiLCAiREUiXQ",
+        "WyJRZ19PNjR6cUF4ZTQxMmExMDhpcm9BIiwgImFkZHJlc3MiLCB7Il9zZCI6IFsiNnZoOWJxLXpTNEdLTV83R3BnZ1ZiWXp6dTZvT0dYcm1OVkdQSFA3NVVkMCIsICI5Z2pWdVh0ZEZST0NnUnJ0TmNHVVhtRjY1cmRlemlfNkVyX2o3NmttWXlNIiwgIktVUkRQaDRaQzE5LTN0aXotRGYzOVY4ZWlkeTFvVjNhM0gxRGEyTjBnODgiLCAiV045cjlkQ0JKOEhUQ3NTMmpLQVN4VGpFeVc1bTV4NjVfWl8ycm8yamZYTSJdfV0",
+    ];
+
+    let disclosure_content = IndexMap::from_iter(disclosures.into_iter().map(|disclosure_str| {
+        let disclosure_type: DisclosureContent =
+            serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(disclosure_str).unwrap()).unwrap();
+        let disclosure = Disclosure::try_new(disclosure_type).unwrap();
+        (Sha256Hasher.encoded_digest(disclosure_str), disclosure)
+    }));
+
+    (claims, disclosure_content)
+}
+
+// Taken from https://www.ietf.org/archive/id/draft-ietf-oauth-selective-disclosure-jwt-17.html#name-elliptic-curve-key-used-in-
+pub fn examples_sd_jwt_decoding_key() -> EcdsaDecodingKey {
+    let jwk = json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "b28d4MwZMjw8-00CG4xfnn9SLMVMM19SlqZpVb_uNtQ",
+        "y": "Xv5zWwuoaTgdS6hV43yI6gBwTnjukmFQQnJ_kCxzqk8"
+    });
+
+    decoding_key_from_jwk(jwk)
+}
+
+fn decoding_key_from_jwk(jwk: serde_json::Value) -> EcdsaDecodingKey {
+    let jwk: Jwk = serde_json::from_value(jwk).unwrap();
+    let verifying_key = jwk_to_p256(&jwk).unwrap();
+    EcdsaDecodingKey::from(&verifying_key)
+}

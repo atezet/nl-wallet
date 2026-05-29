@@ -1,0 +1,112 @@
+use std::assert_matches;
+use std::collections::HashMap;
+
+use attestation_data::auth::reader_auth::ReaderRegistration;
+use attestation_data::x509::CertificateTypeError;
+use attestation_data::x509::generate::mock::generate_reader_mock_with_registration;
+use crypto::server_keys::KeyPair;
+use crypto::server_keys::generate::Ca;
+use crypto::trust_anchor::TrustAnchors;
+use crypto::x509::CertificateError;
+use openid4vc::verifier::SessionTypeReturnUrl;
+use server_utils::settings::CertificateVerificationError;
+use server_utils::settings::ServerSettings;
+use verification_server::settings::UseCaseSettings;
+use verification_server::settings::VerifierSettings;
+
+fn to_use_case(key_pair: KeyPair) -> UseCaseSettings {
+    UseCaseSettings {
+        session_type_return_url: SessionTypeReturnUrl::Both,
+        key_pair: key_pair.into(),
+        dcql_query: None,
+        return_url_template: None,
+        disclosure_base_deep_link: None,
+        accept_undetermined_revocation_status: false,
+    }
+}
+
+#[test]
+fn test_settings_success() {
+    let mut settings =
+        VerifierSettings::new("verification_server.toml", "verification_server").expect("default settings");
+
+    let reader_ca = Ca::generate_reader_mock_ca().expect("generate reader CA");
+    let reader_cert_valid = generate_reader_mock_with_registration(&reader_ca, ReaderRegistration::new_mock())
+        .expect("generate valid reader cert");
+
+    let mut usecases: HashMap<String, UseCaseSettings> = HashMap::new();
+    usecases.insert("valid".to_string(), to_use_case(reader_cert_valid));
+
+    settings.usecases = usecases.into();
+    settings.reader_trust_anchors = TrustAnchors::from(&reader_ca);
+
+    settings.validate().expect("should succeed");
+}
+
+#[test]
+fn test_settings_no_reader_trust_anchors() {
+    let mut settings =
+        VerifierSettings::new("verification_server.toml", "verification_server").expect("default settings");
+
+    let reader_ca = Ca::generate_reader_mock_ca().expect("generate reader CA");
+    let reader_cert_valid = generate_reader_mock_with_registration(&reader_ca, ReaderRegistration::new_mock())
+        .expect("generate valid reader cert");
+
+    let mut usecases: HashMap<String, UseCaseSettings> = HashMap::new();
+    usecases.insert("valid".to_string(), to_use_case(reader_cert_valid));
+
+    settings.usecases = usecases.into();
+    settings.reader_trust_anchors = TrustAnchors::empty();
+
+    let error = settings.validate().expect_err("should fail");
+    assert_matches!(error, CertificateVerificationError::MissingTrustAnchors);
+}
+
+#[test]
+fn test_settings_no_reader_registration() {
+    let mut settings =
+        VerifierSettings::new("verification_server.toml", "verification_server").expect("default settings");
+
+    let reader_ca = Ca::generate_reader_mock_ca().expect("generate reader CA");
+    let reader_cert_valid = generate_reader_mock_with_registration(&reader_ca, ReaderRegistration::new_mock())
+        .expect("generate valid reader cert");
+    let reader_cert_no_registration = reader_ca
+        .generate_reader_mock()
+        .expect("generate reader cert without reader registration");
+
+    let mut usecases: HashMap<String, UseCaseSettings> = HashMap::new();
+    usecases.insert("valid".to_string(), to_use_case(reader_cert_valid));
+    usecases.insert("no_registration".to_string(), to_use_case(reader_cert_no_registration));
+
+    settings.usecases = usecases.into();
+    settings.reader_trust_anchors = TrustAnchors::from(&reader_ca);
+
+    let error = settings.validate().expect_err("should fail");
+    assert_matches!(error, CertificateVerificationError::NoCertificateType(CertificateTypeError::ReaderRegistrationNotFound, key) if key == "no_registration");
+}
+
+#[test]
+fn test_settings_wrong_reader_ca() {
+    let mut settings =
+        VerifierSettings::new("verification_server.toml", "verification_server").expect("default settings");
+
+    let reader_ca = Ca::generate_reader_mock_ca().expect("generate reader CA");
+    let reader_cert_valid = generate_reader_mock_with_registration(&reader_ca, ReaderRegistration::new_mock())
+        .expect("generate valid reader cert");
+    let reader_wrong_ca = Ca::generate_reader_mock_ca().expect("generate wrong reader CA");
+    let reader_cert_wrong_ca = generate_reader_mock_with_registration(&reader_wrong_ca, ReaderRegistration::new_mock())
+        .expect("generate reader cert on wrong CA");
+
+    let mut usecases: HashMap<String, UseCaseSettings> = HashMap::new();
+    usecases.insert("valid".to_string(), to_use_case(reader_cert_valid));
+    usecases.insert("wrong_ca".to_string(), to_use_case(reader_cert_wrong_ca));
+
+    settings.usecases = usecases.into();
+    settings.reader_trust_anchors = TrustAnchors::from(&reader_ca);
+
+    let error = settings.validate().expect_err("should fail");
+    assert_matches!(
+        error,
+        CertificateVerificationError::InvalidCertificate(CertificateError::Verification(_), key) if key == "wrong_ca"
+    );
+}

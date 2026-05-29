@@ -1,0 +1,239 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import net.razvan.JacocoToCoberturaPlugin
+import net.razvan.JacocoToCoberturaTask
+import java.io.ByteArrayOutputStream
+
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+    id("net.razvan.jacoco-to-cobertura")
+}
+
+val ndkTargets = System.getenv("ANDROID_NDK_TARGETS")?.split(' ')
+    ?: listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+
+android {
+    namespace  = "nl.rijksoverheid.edi.wallet.platform_support"
+    compileSdk = 36
+    // Use NDK r28b to get 16kB page size
+    ndkVersion = "28.1.13356709"
+
+    defaultConfig {
+        minSdk = 29
+        lint { targetSdk = 36 }
+        testOptions { targetSdk = 36 }
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles("consumer-rules.pro")
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    buildTypes {
+        debug {
+            enableUnitTestCoverage = true
+            enableAndroidTestCoverage = true
+
+            ndk {
+                abiFilters += ndkTargets
+            }
+        }
+        // Profile is only added if the Flutter plugin is applied
+        if (findByName("profile") != null) getByName("profile") {
+            isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles += listOf(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                file("proguard-rules.pro")
+            )
+            ndk {
+                abiFilters += ndkTargets
+            }
+        }
+        release {
+            isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles += listOf(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                file("proguard-rules.pro")
+            )
+            ndk {
+                abiFilters += ndkTargets
+            }
+        }
+    }
+
+    // Note: When you see the following warnings:
+    //
+    //   warning: [options] source value 8 is obsolete and will be removed in a future release
+    //   warning: [options] target value 8 is obsolete and will be removed in a future release
+    //
+    // That indicates that a transitive dependency still has VERSION_1_8 specified. It is emphatically
+    // *not* due to the sourceCompatibility, targetCompatibility and jvmTarget settings configured below
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        getByName("main") {
+            // UniFFI generated bindings
+            kotlin.srcDirs("../kotlin")
+        }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = JvmTarget.JVM_17
+        freeCompilerArgs = listOf("-Xstring-concat=inline")
+    }
+}
+
+tasks.withType<Test>().configureEach {
+    reports {
+        junitXml.required = true
+    }
+}
+
+tasks.named { it == "testDebugUnitTest" }.configureEach {
+    finalizedBy("jacocoReport")
+}
+tasks.register<JacocoReport>("jacocoReport") {
+    // Explicit setup seems to work best, but might be broken on AGP upgrades
+    classDirectories.setFrom(layout.buildDirectory.file("tmp/kotlin-classes/debug/nl/rijksoverheid/edi/wallet"))
+    executionData.from(layout.buildDirectory.file("outputs/unit_test_code_coverage/debugUnitTest/testDebugUnitTest.exec"))
+    reports {
+        csv.required = false
+        html.required = false
+        xml.required = true
+        xml.outputLocation = layout.buildDirectory.file("reports/coverage/unit/debug/report.xml")
+    }
+}
+tasks.register<JacocoToCoberturaTask>("coberturaReport").configure {
+    // Connect via jacocoReport does not work: https://github.com/gradle/gradle/issues/6619
+    inputFile = layout.buildDirectory.file("reports/coverage/unit/debug/report.xml")
+    outputFile = file("${inputFile.get()}/../cobertura.xml")
+    splitByPackage = false
+    finalizedBy("coberturaReport")
+}
+
+tasks.named<JacocoToCoberturaTask>(JacocoToCoberturaPlugin.TASK_NAME) {
+    inputFile = layout.buildDirectory.file("reports/coverage/androidTest/debug/connected/report.xml")
+    outputFile = file("${inputFile.get()}/../cobertura.xml")
+}
+tasks.named { it == "createDebugAndroidTestCoverageReport" }.configureEach {
+    finalizedBy(JacocoToCoberturaPlugin.TASK_NAME)
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.9.0") // Kotlin nice-to-haves
+    implementation("androidx.startup:startup-runtime:1.1.1") // Auto initialization
+    implementation("com.google.android.play:integrity:1.4.0") // Play Integrity API
+    implementation("net.java.dev.jna:jna:5.14.0@aar") // Java Native Access, Android Archive version
+    implementation("org.multipaz:multipaz:0.96.0") // Multipaz core library
+    implementation("org.multipaz:multipaz-android:0.96.0") // Multipaz Android BLE support
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1") // Kotlin coroutines, core library
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3") // Kotlin coroutines for play-services
+
+    // Unit test dependencies
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("io.kotest:kotest-assertions-core:5.9.1")
+    testImplementation("io.mockk:mockk:1.14.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+
+    // Android test dependencies
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:rules:1.6.1")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+}
+
+// Target directory for the Rust library files & bindings
+val jniTargetDir = android.sourceSets.getByName("main").jniLibs.srcDirs.first()
+val moduleWorkingDir = file("${project.projectDir}/../")
+val bindingsTargetDir = "$moduleWorkingDir/kotlin"
+var integrationTestFeature = "hardware_integration_test"
+
+// Register a task to determine emulator or real device
+tasks.register<Exec>("determineEmulator") {
+    executable = "adb"
+    args("devices")
+    standardOutput = ByteArrayOutputStream()
+    doLast {
+        if (Regex("^emulator", RegexOption.MULTILINE).find(standardOutput.toString()) != null) {
+            logger.warn("Using emulator integration test features")
+            logger.info("This will allow Software security level")
+            logger.info("and skip the root certificate public key check")
+            integrationTestFeature = "emulator_integration_test"
+        } else {
+            logger.info("Using hardware integration test feature")
+            logger.info("Only allow TEE or Strongbox keys")
+            logger.info("and check against the configured root public keys")
+        }
+    }
+}
+
+// Register a task to generate Kotlin bindings
+tasks.register<Exec>("cargoBuildNativeBindings") {
+    executable = "$moduleWorkingDir/generate_native_bindings.sh"
+
+    inputs.files(fileTree("$moduleWorkingDir/udl").matching { include("*.udl") })
+    outputs.dir(bindingsTargetDir)
+    args(listOf("kotlin") + inputs.files.map { it.name })
+}
+
+// Register tasks to build the Rust code and copy the resulting library files
+enum class BuildMode { Debug, Profile, Release }
+data class BuildOptions(val args: List<String> = emptyList())
+mapOf(
+    BuildMode.Debug to BuildOptions(),
+    BuildMode.Profile to BuildOptions(args=listOf("--locked", "--release")),
+    BuildMode.Release to BuildOptions(args=listOf("--locked", "--release")),
+).forEach { (buildMode, options) ->
+    tasks.named { it == "compile${buildMode}Kotlin" }.configureEach {
+        dependsOn("cargoBuildNativeBindings")
+    }
+
+    tasks.register<Exec>("cargoBuildNativeLibrary${buildMode}") {
+        workingDir = moduleWorkingDir
+        executable = "cargo"
+        args("ndk")
+        args(ndkTargets.flatMap { listOf("-t", it) })
+        args("-o", jniTargetDir)
+        args("build")
+        args(options.args)
+        if (buildMode == BuildMode.Debug) {
+            dependsOn("determineEmulator")
+        }
+        doFirst {
+            if (buildMode == BuildMode.Debug) {
+                args("--features", integrationTestFeature)
+            }
+        }
+    }
+    tasks.named { it == "merge${buildMode}NativeLibs" }.configureEach {
+        dependsOn("cargoBuildNativeLibrary${buildMode}")
+    }
+}
+
+tasks.register<Delete>("cleanBindings") {
+    delete(bindingsTargetDir)
+    doFirst {
+        logger.quiet("Clean $bindingsTargetDir")
+    }
+}
+
+tasks.register<Delete>("cleanJni") {
+    delete(jniTargetDir)
+    doFirst {
+        logger.quiet("Clean $jniTargetDir")
+    }
+}
+
+tasks.named("clean") {
+    dependsOn("cleanBindings")
+    dependsOn("cleanJni")
+}
