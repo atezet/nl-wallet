@@ -1,3 +1,0 @@
-{% macro notification(span_text, text, error) %}
-<div role="alert" class="notification {% if !error.to_string().is_empty() %}error{% endif %}"><span>{{ span_text }}</span>{{ text }}</div>
-{% endmacro %}
